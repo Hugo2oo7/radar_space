@@ -62,7 +62,9 @@ def get_trend_icon(name, current_score):
 
 def monitor_and_alert(df_u, df_i):
     paris_tz = pytz.timezone('Europe/Paris')
-    now = datetime.now(paris_tz).strftime("%H:%M:%S")
+    now = datetime.now(paris_tz) # <-- ON GARDE L'OBJET
+    now_str = now.strftime("%H:%M:%S") # <-- VERSION TEXTE POUR DISCORD
+    
     cur_names = df_u['Nom'].tolist()
     cur_identified = df_i['Nom'].tolist() if not df_i.empty else []
     events = []
@@ -95,15 +97,17 @@ def monitor_and_alert(df_u, df_i):
         try: requests.post(DISCORD_WEBHOOK, json={"content": "🛰️ **RADAR SENTINELLE**\n" + "\n".join(events)}, timeout=5)
         except: pass
 
-    # Recap Horaire
-    if (now - st.session_state.last_alert_time).total_seconds() > 3600:
+    # Recap Horaire corrigé
+    # On compare des datetime, pas des str
+    if (now.replace(tzinfo=None) - st.session_state.last_alert_time.replace(tzinfo=None)).total_seconds() > 3600:
         if not df_u.empty:
-            recap = f"📊 **RECAP HORAIRE ({now.strftime('%H:%M')})**\n"
+            recap = f"📊 **RECAP HORAIRE ({now_str})**\n"
             for row in df_u.sort_values("Score", ascending=False).head(5).itertuples():
                 recap += f"- {row.Nom} {get_trend_icon(row.Nom, row.Score)} (S:{row.Score} | m:{row.m})\n"
-            requests.post(DISCORD_WEBHOOK, json={"content": recap})
-            st.session_state.last_alert_time = now
-
+            try:
+                requests.post(DISCORD_WEBHOOK, json={"content": recap})
+                st.session_state.last_alert_time = now
+            except: pass
     st.session_state.old_anomalies = cur_names
     st.session_state.old_identified = cur_identified
 
@@ -145,15 +149,18 @@ def fetch_data():
 
     # Fetch NASA (Cache)
     paris_tz = pytz.timezone('Europe/Paris')
-    now = datetime.now(paris_tz).strftime("%H:%M:%S")
+    now = datetime.now(paris_tz) # <-- ON GARDE L'OBJET ICI (pas de strftime)
+    
     df_n = st.session_state.nasa_cache
-    if (now - st.session_state.last_nasa_request).total_seconds() > 60:
+    # Calcul des secondes entre deux objets datetime
+    if (now.replace(tzinfo=None) - st.session_state.last_nasa_request.replace(tzinfo=None)).total_seconds() > 60:
         try:
             url = f"{NASA_CAD}?dist-max={radius}LD&date-min={now.strftime('%Y-%m-%d')}&date-max={(now+timedelta(days=days)).strftime('%Y-%m-%d')}&fullname=true"
             res = requests.get(url, timeout=20).json()
             if "data" in res:
                 df_n = pd.DataFrame(res["data"], columns=res["fields"])
-                st.session_state.nasa_cache, st.session_state.last_nasa_request = df_n, now
+                st.session_state.nasa_cache = df_n
+                st.session_state.last_nasa_request = now
         except: pass
     return df_u, df_n
 
