@@ -205,15 +205,30 @@ with c_h3: st.metric("🔭 État NASA", "Synchronisé", delta="OK")
 # --- TABLEAUX PRINCIPAUX ---
 tab1, tab2, tab3 = st.tabs(["🔭 SURVEILLANCE CRITIQUE", "☄️ CATALOGUE NASA", "🌠 COMÈTES"])
 
-with tab1:
-    col_a, col_b = st.columns([1.5, 1])
-    with col_a:
-        st.subheader("Anomalies Détectées (Non Identifiées)")
-        if not df_anom.empty:
-            df_disp = df_anom.copy()
-            df_disp['Tendance'] = df_disp.apply(lambda r: get_trend_icon(r['Nom'], r['Score']), axis=1)
-            st.dataframe(df_disp[["Nom", "Tendance", "Score", "m", "Type"]], width="stretch", hide_index=True)
-        else: st.success("Aucune anomalie suspecte détectée.")
+with col_a:
+    st.subheader("Anomalies Détectées (Non Identifiées)")
+    if not df_anom.empty:
+        df_disp = df_anom.copy()
+        df_disp['Tendance'] = df_disp.apply(lambda r: get_trend_icon(r['Nom'], r['Score']), axis=1)
+        
+        # Configuration visuelle sans matplotlib
+        st.dataframe(
+            df_disp[["Nom", "Tendance", "Score", "m", "Type"]],
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score de Risque",
+                    help="Priorité de surveillance",
+                    format="%d%%",
+                    min_value=0,
+                    max_value=100,
+                ),
+                "Type": st.column_config.TextColumn("Classification")
+            },
+            width="stretch",
+            hide_index=True
+        )
+    else:
+        st.success("Aucune anomalie suspecte détectée.")
     
     with col_b:
         st.subheader("Objets en Cours d'Identification")
