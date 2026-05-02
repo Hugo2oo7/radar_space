@@ -8,7 +8,6 @@ import os
 from datetime import datetime, timedelta
 import pytz
 import time
-import random
 import urllib3
 
 # Désactivation des alertes SSL
@@ -20,20 +19,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning())
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1499765998377635900/FBUhSnXY4kBk7fSepXKJvCsIMe47njutPe31ttYURvfcW21Vz4ZxVu5xLweC1n6HgeOJ"
 MPC_NEOCP = "https://minorplanetcenter.net/iau/NEO/neocp.txt"
 NASA_CAD = "https://ssd-api.jpl.nasa.gov/cad.api"
-DB_FILE = "radar_history.json"
 
 st.set_page_config(page_title="Radar Spatial V20.0", layout="wide", page_icon="🛰️")
 
-# CSS Personnalisé pour aérer l'interface
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
     .stMetric { background-color: #1e2130; padding: 15px; border-radius: 10px; border-left: 5px solid #ff4b4b; }
     div[data-testid="stExpander"] { border: none !important; box-shadow: none !important; background-color: #161b22; border-radius: 15px; }
-    .stDataFrame { border-radius: 10px; overflow: hidden; }
-    h1, h2, h3 { color: #ffffff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    h1, h2, h3 { color: #ffffff; font-family: 'Segoe UI', sans-serif; }
     </style>
-    """, unsafe_allow_html=True) # <-- C'est ici que j'avais mis 'value' au lieu de 'html'
+    """, unsafe_allow_html=True)
 
 # Initialisation des états
 if 'nasa_cache' not in st.session_state: st.session_state.nasa_cache = pd.DataFrame()
@@ -43,9 +39,10 @@ if 'old_anomalies' not in st.session_state: st.session_state.old_anomalies = []
 if 'old_identified' not in st.session_state: st.session_state.old_identified = []
 if 'alerted_high_score' not in st.session_state: st.session_state.alerted_high_score = []
 if 'alerted_critical_score' not in st.session_state: st.session_state.alerted_critical_score = []
+if 'obj_history' not in st.session_state: st.session_state.obj_history = {}
 
 # ==========================================
-# FONCTIONS LOGIQUES & ALERTES
+# FONCTIONS LOGIQUES
 # ==========================================
 
 def get_detailed_type(name, fullname=""):
@@ -62,78 +59,49 @@ def get_trend_icon(name, current_score):
 
 def monitor_and_alert(df_u, df_i):
     paris_tz = pytz.timezone('Europe/Paris')
-    now = datetime.now(paris_tz) # <-- ON GARDE L'OBJET
-    now_str = now.strftime("%H:%M:%S") # <-- VERSION TEXTE POUR DISCORD
+    now = datetime.now(paris_tz)
+    now_str = now.strftime("%H:%M:%S")
     
-    cur_names = df_u['Nom'].tolist()
+    cur_names = df_u['Nom'].tolist() if not df_u.empty else []
     cur_identified = df_i['Nom'].tolist() if not df_i.empty else []
     events = []
 
-    for r in df_u.itertuples():
-        tr = get_trend_icon(r.Nom, r.Score)
-        # Alertes Niveaux
-        if r.Score >= 80 and r.Nom not in st.session_state.alerted_critical_score:
-            events.append(f"🚨 **CRITIQUE (80+) :** `{r.Nom}` {tr} Score: {r.Score}")
-            st.session_state.alerted_critical_score.append(r.Nom)
-        elif r.Score >= 50 and r.Nom not in st.session_state.alerted_high_score:
-            events.append(f"🔥 **SEUIL 50 :** `{r.Nom}` {tr} Score: {r.Score}")
-            st.session_state.alerted_high_score.append(r.Nom)
-        
-        # Mouvements brusques
-        hist = st.session_state.obj_history.get(r.Nom, [])
-        if len(hist) >= 2:
-            diff = r.Score - hist[-2]["S"]
-            if abs(diff) >= 2.0:
-                events.append(f"{'📈' if diff>0 else '📉'} **VARIATION :** `{r.Nom}` {tr} ({diff:+.1f})")
+    if not df_u.empty:
+        for r in df_u.itertuples():
+            tr = get_trend_icon(r.Nom, r.Score)
+            if r.Score >= 80 and r.Nom not in st.session_state.alerted_critical_score:
+                events.append(f"🚨 **CRITIQUE (80+) :** `{r.Nom}` {tr} Score: {r.Score}")
+                st.session_state.alerted_critical_score.append(r.Nom)
+            elif r.Score >= 50 and r.Nom not in st.session_state.alerted_high_score:
+                events.append(f"🔥 **SEUIL 50 :** `{r.Nom}` {tr} Score: {r.Score}")
+                st.session_state.alerted_high_score.append(r.Nom)
 
-    # Flux (Nouveaux / Promotions)
     new = [n for n in cur_names if n not in st.session_state.old_anomalies and n not in st.session_state.old_identified]
-    if new: events.append(f"🆕 **NOUVEAU :** `{', '.join(new)}` est apparu !")
+    if new: events.append(f"🆕 **NOUVEAU :** `{', '.join(new)}` détecté !")
     
-    promoted = [n for n in cur_identified if n in st.session_state.old_anomalies]
-    if promoted: events.append(f"🎓 **PROMOTION :** `{', '.join(promoted)}` identifié NASA !")
-
     if events:
         try: requests.post(DISCORD_WEBHOOK, json={"content": "🛰️ **RADAR SENTINELLE**\n" + "\n".join(events)}, timeout=5)
         except: pass
 
-    # Recap Horaire corrigé
-    # On compare des datetime, pas des str
+    # Recap Horaire
     if (now.replace(tzinfo=None) - st.session_state.last_alert_time.replace(tzinfo=None)).total_seconds() > 3600:
         if not df_u.empty:
             recap = f"📊 **RECAP HORAIRE ({now_str})**\n"
             for row in df_u.sort_values("Score", ascending=False).head(5).itertuples():
-                recap += f"- {row.Nom} {get_trend_icon(row.Nom, row.Score)} (S:{row.Score} | m:{row.m})\n"
-            try:
+                recap += f"- {row.Nom} {get_trend_icon(row.Nom, row.Score)} (S:{row.Score})\n"
+            try: 
                 requests.post(DISCORD_WEBHOOK, json={"content": recap})
                 st.session_state.last_alert_time = now
             except: pass
+
     st.session_state.old_anomalies = cur_names
     st.session_state.old_identified = cur_identified
-
-# ==========================================
-# SIDEBAR
-# ==========================================
-with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/e/e5/NASA_logo.svg", width=80)
-    st.title("Contrôle Radar")
-    if st.button("🚨 TEST DISCORD"):
-        monitor_and_alert(pd.DataFrame([{"Nom": "TEST_OBJ", "Score": 99.0, "m": 12.0}]), pd.DataFrame())
-    
-    st.divider()
-    refresh = st.slider("Rafraîchissement (s)", 10, 300, 30)
-    days = st.slider("Horizon (Jours)", 1, 90, 30)
-    radius = st.slider("Rayon (LD)", 1, 1000, 300)
-    
-    st.divider()
-    vespera = st.toggle("Mode Vespera", value=True)
-    mag_limit = st.slider("Magnitude Max", 5.0, 22.0, 15.5, disabled=not vespera)
 
 # ==========================================
 # DATA FETCHING
 # ==========================================
 
-def fetch_data():
+def fetch_data(radius, days):
     # Fetch MPC
     df_u = pd.DataFrame()
     try:
@@ -147,12 +115,11 @@ def fetch_data():
         df_u = pd.DataFrame(data, columns=["Nom", "Type", "m", "Score"])
     except: pass
 
-    # Fetch NASA (Cache)
+    # Fetch NASA
     paris_tz = pytz.timezone('Europe/Paris')
-    now = datetime.now(paris_tz) # <-- ON GARDE L'OBJET ICI (pas de strftime)
-    
+    now = datetime.now(paris_tz)
     df_n = st.session_state.nasa_cache
-    # Calcul des secondes entre deux objets datetime
+    
     if (now.replace(tzinfo=None) - st.session_state.last_nasa_request.replace(tzinfo=None)).total_seconds() > 60:
         try:
             url = f"{NASA_CAD}?dist-max={radius}LD&date-min={now.strftime('%Y-%m-%d')}&date-max={(now+timedelta(days=days)).strftime('%Y-%m-%d')}&fullname=true"
@@ -165,121 +132,85 @@ def fetch_data():
     return df_u, df_n
 
 def fetch_comets():
-    if 'comet_cache' in st.session_state and (datetime.now() - st.session_state.get('last_comet_time', datetime.now())).total_seconds() < 3600:
-        return st.session_state.comet_cache
     try:
         r = requests.get("https://www.minorplanetcenter.net/iau/Ephemerides/Comets/Soft00Cmt.txt", timeout=15, verify=False)
         data = [{"Nom": l[0:43].strip(), "Mag": float(l[123:129])} for l in r.text.split('\n') if len(l) > 130 and l[123:129].strip()]
-        df = pd.DataFrame(data)
-        st.session_state.comet_cache, st.session_state.last_comet_time = df, datetime.now()
-        return df
-    except: return st.session_state.get('comet_cache', pd.DataFrame())
+        return pd.DataFrame(data)
+    except: return pd.DataFrame()
 
 # ==========================================
-# INTERFACE PRINCIPALE
+# INTERFACE & SIDEBAR
 # ==========================================
-df_mpc, df_nasa = fetch_data()
+with st.sidebar:
+    st.image("https://upload.wikimedia.org/wikipedia/commons/e/e5/NASA_logo.svg", width=80)
+    st.title("Contrôle Radar")
+    if st.button("🚨 TEST DISCORD"):
+        monitor_and_alert(pd.DataFrame([{"Nom": "TEST_OBJ", "Score": 99.0, "m": 12.0}]), pd.DataFrame())
+    
+    refresh = st.slider("Rafraîchissement (s)", 10, 300, 30)
+    days = st.slider("Horizon (Jours)", 1, 90, 30)
+    radius = st.slider("Rayon (LD)", 1, 1000, 300)
+    vespera = st.toggle("Mode Vespera", value=True)
+    mag_limit = st.slider("Magnitude Max", 5.0, 22.0, 15.5, disabled=not vespera)
+
+# Chargement
+df_mpc, df_nasa = fetch_data(radius, days)
 df_comets = fetch_comets()
 
 # Historique
-if 'obj_history' not in st.session_state: st.session_state.obj_history = {}
 if not df_mpc.empty:
     for r in df_mpc.itertuples():
         if r.Nom not in st.session_state.obj_history: st.session_state.obj_history[r.Nom] = []
         st.session_state.obj_history[r.Nom].append({"H": datetime.now().strftime("%H:%M"), "S": r.Score})
 
-# Separation Anomalies / Identifiés
 nasa_list = df_nasa['des'].tolist() if not df_nasa.empty else []
 df_anom = df_mpc[~df_mpc['Nom'].isin(nasa_list)].sort_values("Score", ascending=False)
 df_id = df_mpc[df_mpc['Nom'].isin(nasa_list)]
 
-# Lancement Alertes
 monitor_and_alert(df_anom, df_id)
 
-# --- HEADER ---
-c_h1, c_h2, c_h3 = st.columns([2,1,1])
-with c_h1: st.title("🛰️ Deep Space Radar V20.0")
-with c_h2: st.metric("📡 État MPC", "Connecté", delta="Live")
-with c_h3: st.metric("🔭 État NASA", "Synchronisé", delta="OK")
-
-# --- TABLEAUX PRINCIPAUX ---
+# --- AFFICHAGE ---
+st.title("🛰️ Deep Space Radar V20.0")
 tab1, tab2, tab3 = st.tabs(["🔭 SURVEILLANCE CRITIQUE", "☄️ CATALOGUE NASA", "🌠 COMÈTES"])
 
-with col_a:
-    st.subheader("Anomalies Détectées (Non Identifiées)")
-    if not df_anom.empty:
-        df_disp = df_anom.copy()
-        df_disp['Tendance'] = df_disp.apply(lambda r: get_trend_icon(r['Nom'], r['Score']), axis=1)
-        
-        # Configuration visuelle sans matplotlib
-        st.dataframe(
-            df_disp[["Nom", "Tendance", "Score", "m", "Type"]],
-            column_config={
-                "Score": st.column_config.ProgressColumn(
-                    "Score de Risque",
-                    help="Priorité de surveillance",
-                    format="%d%%",
-                    min_value=0,
-                    max_value=100,
-                ),
-                "Type": st.column_config.TextColumn("Classification")
-            },
-            width="stretch",
-            hide_index=True
-        )
-    else:
-        st.success("Aucune anomalie suspecte détectée.")
+with tab1:
+    col_gauche, col_droite = st.columns([1.5, 1])
+    with col_gauche:
+        st.subheader("Anomalies Détectées")
+        if not df_anom.empty:
+            df_disp = df_anom.copy()
+            df_disp['Tendance'] = df_disp.apply(lambda r: get_trend_icon(r['Nom'], r['Score']), axis=1)
+            st.dataframe(
+                df_disp[["Nom", "Tendance", "Score", "m", "Type"]],
+                column_config={
+                    "Score": st.column_config.ProgressColumn("Score de Risque", format="%d", min_value=0, max_value=100),
+                    "m": "Mag"
+                },
+                width="stretch", hide_index=True
+            )
+        else: st.success("Aucune anomalie suspecte.")
     
-    with col_b:
-        st.subheader("Objets en Cours d'Identification")
-        st.dataframe(df_id[["Nom", "Score", "m"]], use_container_width=True, hide_index=True)
+    with col_droite:
+        st.subheader("Objets Identifiés")
+        st.dataframe(df_id[["Nom", "Score", "m"]], width="stretch", hide_index=True)
 
 with tab2:
-    st.subheader("Objets Confirmés par le JPL (NASA)")
     if not df_nasa.empty:
-        df_nasa['h'] = pd.to_numeric(df_nasa['h'], errors='coerce')
-        df_nasa['m_est'] = df_nasa.apply(lambda r: round(float(r['h']) + 5 * math.log10(max(0.1, float(r['v_rel']))/10) + 0.5, 1) if not pd.isna(r['h']) else 99, axis=1)
-        df_nasa['Type'] = df_nasa.apply(lambda r: get_detailed_type(r['des']), axis=1)
+        df_nasa['m_est'] = pd.to_numeric(df_nasa['h'], errors='coerce').apply(lambda x: round(x + 2, 1))
         if vespera: df_nasa = df_nasa[df_nasa['m_est'] <= mag_limit]
-        cols = ["des", "Type", "h", "cd", "dist", "v_rel", "m_est"]
-        st.dataframe(df_nasa[cols].sort_values("dist"), use_container_width=True, hide_index=True)
+        st.dataframe(df_nasa[["des", "cd", "dist", "v_rel", "m_est"]].sort_values("dist"), width="stretch", hide_index=True)
 
 with tab3:
-    st.subheader("Comètes Actives")
     if not df_comets.empty:
-        st.dataframe(df_comets[df_comets['Mag'] <= (mag_limit if vespera else 20)].sort_values("Mag"), use_container_width=True, hide_index=True)
-    else: st.warning("Données cométaires indisponibles.")
+        df_com_disp = df_comets[df_comets['Mag'] <= (mag_limit if vespera else 20)]
+        st.dataframe(df_com_disp.sort_values("Mag"), width="stretch", hide_index=True)
 
-# --- ANALYSE & LEXIQUE ---
+# Graphique
 st.divider()
-c_low1, c_low2 = st.columns([1, 1.2])
+target = st.selectbox("Suivre un objet :", list(st.session_state.obj_history.keys()))
+if target:
+    h_df = pd.DataFrame(st.session_state.obj_history[target]).set_index("H")
+    st.line_chart(h_df, color="#ff4b4b")
 
-with c_low1:
-    st.subheader("📈 Sismographe de Score")
-    target = st.selectbox("Sélectionner un objet à suivre :", list(st.session_state.obj_history.keys()))
-    if target:
-        h_df = pd.DataFrame(st.session_state.obj_history[target]).set_index("H")
-        st.line_chart(h_df, color="#ff4b4b")
-
-with c_low2:
-    st.subheader("📘 Lexique & Ordres de Grandeur")
-    col_odg1, col_odg2 = st.columns(2)
-    with col_odg1:
-        st.markdown("""
-        **📏 Taille (H)**
-        - `< 18` : **Monstre** (+1 km)
-        - `22` : **Régional** (~140 m)
-        - `> 26` : **Local** (< 20 m)
-        """)
-    with col_odg2:
-        st.markdown("""
-        **🔆 Brillance (m)**
-        - `< 6` : Oeil nu
-        - `10-15` : **Cible Vespera**
-        - `> 19` : Télescopes Pro
-        """)
-    st.info("💡 **Distance** : 1 LD = 384 400 km (Terre-Lune).")
-
-# Loop
 time.sleep(refresh)
 st.rerun()
