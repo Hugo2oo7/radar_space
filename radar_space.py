@@ -202,7 +202,7 @@ with tab1:
         if not df_anom.empty:
             df_disp = df_anom.copy()
             df_disp['Tendance'] = df_disp.apply(lambda r: get_trend_icon(r['Nom'], r['Score']), axis=1)
-            st.dataframe(df_disp[["Nom", "Tendance", "Score", "m", "Type"]].style.background_gradient(cmap="YlOrRd", subset=["Score"]), use_container_width=True, hide_index=True)
+            st.dataframe(df_disp[["Nom", "Tendance", "Score", "m", "Type"]], width="stretch", hide_index=True)
         else: st.success("Aucune anomalie suspecte détectée.")
     
     with col_b:
