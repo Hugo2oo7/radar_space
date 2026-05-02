@@ -6,6 +6,7 @@ import math
 import json
 import os
 from datetime import datetime, timedelta
+import pytz
 import time
 import random
 import urllib3
@@ -60,7 +61,8 @@ def get_trend_icon(name, current_score):
     return "↗️" if diff > 0.5 else "↘️" if diff < -0.5 else "➡️"
 
 def monitor_and_alert(df_u, df_i):
-    now = datetime.now()
+    paris_tz = pytz.timezone('Europe/Paris')
+    now = datetime.now(paris_tz).strftime("%H:%M:%S")
     cur_names = df_u['Nom'].tolist()
     cur_identified = df_i['Nom'].tolist() if not df_i.empty else []
     events = []
@@ -142,7 +144,8 @@ def fetch_data():
     except: pass
 
     # Fetch NASA (Cache)
-    now = datetime.now()
+    paris_tz = pytz.timezone('Europe/Paris')
+    now = datetime.now(paris_tz).strftime("%H:%M:%S")
     df_n = st.session_state.nasa_cache
     if (now - st.session_state.last_nasa_request).total_seconds() > 60:
         try:
