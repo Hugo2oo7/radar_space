@@ -1,5 +1,4 @@
 streamlit
-pandas
 requests
-pytz
-matplotlib
+pandas
+urllib3
