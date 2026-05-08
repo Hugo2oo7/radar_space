@@ -5,6 +5,7 @@ import re
 import time
 import math
 import urllib3
+import json
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 
@@ -15,42 +16,66 @@ DISCORD_WEBHOOK = (
     "FBUhSnXY4kBk7fSepXKJvCsIMe47njutPe31ttYURvfcW21Vz4ZxVu5xLweC1n6HgeOJ"
 )
 
-# ── Sources ────────────────────────────────────────────────────────────────────
-# Scout = API NASA officielle listant TOUS les objets NEOCP actifs (mode S sans tdes)
-# Avantages : données riches (vmag, moid, caDist, neoScore MPC, elong, rate...)
-# + quand un objet est désigné, il disparaît de Scout → signal propre de transition
-SCOUT_API   = "https://ssd-api.jpl.nasa.gov/scout.api"
-SCOUT_OBJ   = "https://ssd-api.jpl.nasa.gov/scout.api?tdes={}"  # détail par objet
-NASA_CAD    = "https://ssd-api.jpl.nasa.gov/cad.api"
-NASA_SBDB   = "https://ssd-api.jpl.nasa.gov/sbdb.api"
-MPC_COMET   = "https://www.minorplanetcenter.net/iau/Ephemerides/Comets/Soft00Cmt.txt"
-# Page "Previous NEOCP" : liste les objets récemment retirés avec raison + désignation officielle
-# Format JSON disponible via l'API MPC
-MPC_PREV_API = "https://www.minorplanetcenter.net/iau/NEO/pccp_tabular.html"
-MPC_PREV_JSON = "https://data.minorplanetcenter.net/api/get-neocp-objects-removed"
+# ── APIs ───────────────────────────────────────────────────────────────────────
+SCOUT_API        = "https://ssd-api.jpl.nasa.gov/scout.api"
+NASA_CAD         = "https://ssd-api.jpl.nasa.gov/cad.api"
+NASA_SBDB        = "https://ssd-api.jpl.nasa.gov/sbdb.api"
+HORIZONS_API     = "https://ssd.jpl.nasa.gov/api/horizons.api"
+ROCHESTER_SN     = "https://rochesterastronomy.org/supernova.html"
+ROCHESTER_SN26   = "https://rochesterastronomy.org/sn2026/index.html"
+TNS_SEARCH       = "https://www.wis-tns.org/search"
+COMET_URL        = "http://www.minorplanetcenter.net/iau/MPCORB/CometEls.txt"
+MPC_PREV_JSON    = "https://data.minorplanetcenter.net/api/get-neocp-objects-removed"
+SNEWS_ALERT      = "https://snews2.org/"   # SuperNova Early Warning System
 
-# Vespera II — specs
-VESP_SHORT  = 14.5   # session 10 min
-VESP_MEDIUM = 16.0   # session 30 min
-VESP_LONG   = 17.5   # nuit entière, ciel sombre
-VESP_LIMIT  = 19.0   # limite absolue instrument
+# ── Vespera II specs ───────────────────────────────────────────────────────────
+VESP_SHORT  = 14.5
+VESP_MEDIUM = 16.0
+VESP_LONG   = 17.5
+VESP_LIMIT  = 19.0
+
+# ── Types de supernovæ (pour affichage enrichi) ────────────────────────────────
+SN_TYPE_INFO = {
+    "Ia":    {"emoji": "💥", "desc": "Naine blanche thermonucléaire", "duree": "~60j", "couleur": "#ff6b6b"},
+    "Ib":    {"emoji": "🌀", "desc": "Effondrement — étoile dépouillée H", "duree": "~40j", "couleur": "#ff9f43"},
+    "Ic":    {"emoji": "🌀", "desc": "Effondrement — étoile dépouillée H+He", "duree": "~35j", "couleur": "#ff9f43"},
+    "Ic-BL": {"emoji": "⚡", "desc": "Ic hypernova — liée à un GRB", "duree": "~30j", "couleur": "#ff4757"},
+    "II":    {"emoji": "💫", "desc": "Effondrement cœur — supergéante rouge", "duree": "~100j", "couleur": "#54a0ff"},
+    "II-P":  {"emoji": "💫", "desc": "Type II à plateau (hydrogène riche)", "duree": "~120j", "couleur": "#54a0ff"},
+    "IIn":   {"emoji": "🌊", "desc": "Interaction avec enveloppe circumstellaire", "duree": "~200j+", "couleur": "#5f27cd"},
+    "IIb":   {"emoji": "🔀", "desc": "Transition II→Ib (perte partielle H)", "duree": "~80j", "couleur": "#00d2d3"},
+    "SLSN-I":{"emoji": "🚀", "desc": "Super-lumineuse sans H (magnétar?)", "duree": "~200j+", "couleur": "#ffd32a"},
+    "SLSN-II":{"emoji":"🚀", "desc": "Super-lumineuse avec H", "duree": "~200j+", "couleur": "#ffd32a"},
+    "TDE":   {"emoji": "🕳️", "desc": "Disruption par marées (trou noir)", "duree": "variable", "couleur": "#ff6b81"},
+    "Nova":  {"emoji": "✨", "desc": "Nova (naine blanche + compagnon)", "duree": "~weeks", "couleur": "#eccc68"},
+    "?":     {"emoji": "❓", "desc": "Type non classifié", "duree": "?", "couleur": "#747d8c"},
+}
+
+def sn_type_info(t: str) -> dict:
+    if not t or t in ("", "None", "nan"): return SN_TYPE_INFO["?"]
+    t = str(t).strip()
+    for k in SN_TYPE_INFO:
+        if k.lower() in t.lower(): return SN_TYPE_INFO[k]
+    return SN_TYPE_INFO["?"]
 
 st.set_page_config(page_title="Deep Space Radar", layout="wide", page_icon="🛰️")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CSS — identique V26 (compact)
+# CSS
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&family=Exo+2:wght@300;400;600&display=swap');
 :root{--bg:#07090f;--surface:#0d1120;--surface2:#131829;--border:#1e2a45;
       --accent:#00d4ff;--accent2:#ff4b4b;--accent3:#f7b731;--green:#00ff88;
+      --purple:#b44eff;--pink:#ff6b9d;
       --text:#c8d8f0;--muted:#5a7090;
       --mono:'Share Tech Mono',monospace;--ui:'Rajdhani',sans-serif;--body:'Exo 2',sans-serif;}
 html,body,[class*="css"]{font-family:var(--body);background-color:var(--bg)!important;color:var(--text);}
 .stApp::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(ellipse 80% 50% at 20% 10%,rgba(0,212,255,.06) 0%,transparent 60%),
-             radial-gradient(ellipse 60% 40% at 80% 80%,rgba(255,75,75,.05) 0%,transparent 60%);}
+             radial-gradient(ellipse 60% 40% at 80% 80%,rgba(255,75,75,.05) 0%,transparent 60%),
+             radial-gradient(ellipse 40% 30% at 50% 50%,rgba(180,78,255,.03) 0%,transparent 60%);}
 section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0a0e1a,#0d1323)!important;border-right:1px solid var(--border)!important;}
 .radar-logo{font-family:var(--mono);font-size:2.2em;letter-spacing:-2px;color:var(--accent);text-shadow:0 0 20px rgba(0,212,255,.5);}
 .radar-sub{font-family:var(--ui);font-size:.8em;color:var(--muted);letter-spacing:3px;text-transform:uppercase;}
@@ -58,12 +83,18 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0a0e1a,#0d13
            font-family:var(--mono);font-size:.82em;color:var(--accent);display:inline-flex;align-items:center;gap:7px;}
 .sync-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:blink 1.2s infinite;}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+@keyframes pulse-red{0%,100%{box-shadow:0 0 0 0 rgba(255,75,75,.4)}70%{box-shadow:0 0 0 8px rgba(255,75,75,0)}}
+@keyframes nova-glow{0%,100%{text-shadow:0 0 8px rgba(255,215,0,.6)}50%{text-shadow:0 0 20px rgba(255,215,0,1),0 0 40px rgba(255,100,0,.8)}}
 .metric-grid{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap;}
 .metric-card{flex:1;min-width:115px;background:var(--surface);border:1px solid var(--border);
              border-top:3px solid var(--accent);border-radius:10px;padding:12px 16px;}
-.metric-card.w{border-top-color:var(--accent2);} .metric-card.c{border-top-color:var(--accent3);} .metric-card.g{border-top-color:var(--green);}
+.metric-card.w{border-top-color:var(--accent2);} .metric-card.c{border-top-color:var(--accent3);}
+.metric-card.g{border-top-color:var(--green);} .metric-card.p{border-top-color:var(--purple);}
+.metric-card.pk{border-top-color:var(--pink);}
 .metric-val{font-family:var(--mono);font-size:1.9em;color:var(--accent);line-height:1.1;}
-.metric-card.w .metric-val{color:var(--accent2);} .metric-card.c .metric-val{color:var(--accent3);} .metric-card.g .metric-val{color:var(--green);}
+.metric-card.w .metric-val{color:var(--accent2);} .metric-card.c .metric-val{color:var(--accent3);}
+.metric-card.g .metric-val{color:var(--green);} .metric-card.p .metric-val{color:var(--purple);}
+.metric-card.pk .metric-val{color:var(--pink);}
 .metric-label{font-family:var(--ui);font-size:.72em;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-top:3px;}
 .stTabs [data-baseweb="tab-list"]{background:transparent;border-bottom:1px solid var(--border);}
 .stTabs [data-baseweb="tab"]{font-family:var(--ui);font-weight:600;font-size:.88em;color:var(--muted)!important;
@@ -72,16 +103,32 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0a0e1a,#0d13
 .sec{font-family:var(--ui);font-size:.95em;font-weight:700;letter-spacing:2px;text-transform:uppercase;
      color:var(--accent);margin-bottom:10px;display:flex;align-items:center;gap:7px;}
 .sec::before{content:'';display:inline-block;width:4px;height:16px;background:var(--accent);border-radius:2px;}
+.sec.sn{color:var(--purple);} .sec.sn::before{background:var(--purple);}
 .empty{background:var(--surface2);border:1px dashed var(--border);border-radius:8px;padding:20px;
        text-align:center;color:var(--muted);font-family:var(--mono);font-size:.82em;}
 .sidebar-sec{font-family:var(--ui);font-size:.68em;letter-spacing:3px;text-transform:uppercase;color:var(--muted);
              margin:16px 0 5px;padding-top:10px;border-top:1px solid var(--border);}
+/* carte supernova */
+.sn-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+         padding:16px 18px;margin-bottom:10px;position:relative;overflow:hidden;}
+.sn-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;}
+.sn-card.vespera::before{background:linear-gradient(90deg,var(--green),var(--accent));}
+.sn-card.marginal::before{background:linear-gradient(90deg,var(--accent3),var(--accent2));}
+.sn-card.outofrange::before{background:var(--muted);}
+.sn-card.galactic{animation:pulse-red 2s infinite;border-color:var(--accent2)!important;}
+.sn-card.galactic::before{background:linear-gradient(90deg,var(--accent2),var(--accent3)) !important;}
+.sn-name{font-family:var(--mono);font-size:1.1em;color:var(--accent3);font-weight:bold;}
+.sn-name.galactic-name{animation:nova-glow 1.5s infinite;color:#ffd700 !important;}
+.sn-host{color:var(--muted);font-size:.82em;font-family:var(--body);}
+.sn-badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:.72em;
+          font-family:var(--mono);border:1px solid;margin-right:4px;}
+.sn-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px;margin-top:10px;}
+.sn-stat{background:var(--surface2);border-radius:6px;padding:6px 10px;}
+.sn-stat-k{font-size:.68em;color:var(--muted);font-family:var(--mono);text-transform:uppercase;}
+.sn-stat-v{font-size:.9em;color:var(--text);font-weight:600;}
 /* carte transition */
 .trans-card{background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--accent3);
             border-radius:10px;padding:14px 16px;margin-bottom:8px;}
-.trans-title{font-family:var(--ui);font-weight:700;font-size:.95em;color:var(--accent3);margin-bottom:8px;}
-.trans-row{display:flex;gap:12px;font-size:.8em;padding:2px 0;color:var(--text);}
-.trans-k{color:var(--muted);font-family:var(--mono);min-width:120px;}
 /* discord */
 .dc-row{display:flex;gap:10px;align-items:baseline;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:.8em;}
 .dc-row:last-child{border-bottom:none;}
@@ -95,6 +142,19 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0a0e1a,#0d13
 .jpl-title{font-family:var(--ui);font-size:.95em;font-weight:700;color:var(--accent3);margin-bottom:10px;}
 .jpl-f{margin-bottom:6px;font-family:var(--mono);font-size:.8em;color:var(--muted);}
 .jpl-v{color:var(--text);font-weight:bold;}
+/* fun facts */
+.fun-fact{background:linear-gradient(135deg,rgba(180,78,255,.08),rgba(0,212,255,.05));
+          border:1px solid rgba(180,78,255,.25);border-radius:10px;padding:14px 16px;margin-top:10px;}
+.fun-fact-title{font-family:var(--mono);font-size:.75em;color:var(--purple);letter-spacing:2px;margin-bottom:6px;}
+.fun-fact-text{font-size:.85em;color:var(--text);line-height:1.6;}
+/* alerte galactique */
+.galactic-alert{background:linear-gradient(135deg,rgba(255,75,75,.15),rgba(247,183,49,.1));
+                border:2px solid var(--accent2);border-radius:12px;padding:20px;
+                text-align:center;animation:pulse-red 2s infinite;}
+.galactic-alert-title{font-family:var(--mono);font-size:1.4em;color:#ff4b4b;
+                       text-shadow:0 0 20px rgba(255,75,75,.8);margin-bottom:8px;}
+/* étoile qui pulse */
+.star-pulse{display:inline-block;animation:nova-glow 1s infinite;}
 #MainMenu,footer,header{visibility:hidden;}
 .block-container{padding-top:1.4rem!important;}
 </style>
@@ -106,42 +166,59 @@ section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0a0e1a,#0d13
 def _init(k, v):
     if k not in st.session_state: st.session_state[k] = v
 
-_init('obj_history',        {})   # tdes → [{T, S, H, NObs, Arc, Vmag, moid}]
+_init('obj_history',        {})
 _init('nasa_cache',         pd.DataFrame())
 _init('comet_cache',        pd.DataFrame())
 _init('scout_cache',        pd.DataFrame())
+_init('sn_cache',           pd.DataFrame())          # supernovæ Rochester
 _init('last_nasa_req',      datetime.now() - timedelta(minutes=5))
 _init('last_scout_req',     datetime.now() - timedelta(minutes=5))
 _init('last_comet_req',     datetime.now() - timedelta(hours=3))
+_init('last_sn_req',        datetime.now() - timedelta(hours=2))
 _init('last_alert_time',    datetime.now() - timedelta(hours=2))
 _init('last_refresh',       datetime.now())
 _init('discord_log',        [])
+_init('discord_queue',      [])
 _init('alerted_new',        set())
 _init('alerted_gone',       set())
-_init('alerted_recognized', set())
+_init('alerted_sn',         set())          # SN déjà alertées Discord
+_init('alerted_sn_vespera', set())          # SN Vespera déjà alertées
+_init('alerted_galactic',   set())          # SN galactiques alertées
 _init('score_palier',       {})
 _init('prev_top5',          [])
 _init('prev_noms',          set())
-# Objets reconnus (tdes → info de transition)
-_init('recognized_objects', {})   # tdes → {nom_officiel, H, q, e, i, dist_nasa, date, source}
-# Cache de la liste des objets retirés du NEOCP (Previous NEOCP page MPC)
-_init('prev_neocp_cache',   {})   # tdes → {designation, reason, date}
+_init('recognized_objects', {})
+_init('prev_neocp_cache',   {})
 _init('last_prev_req',      datetime.now() - timedelta(hours=2))
-# Objets archivés manuellement (retirés de l'affichage et de l'historique)
 _init('archived',           set())
+_init('fun_fact_idx',       0)
+_init('sn_history',         {})             # nom SN → liste de magnitudes horodatées
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FUN FACTS (bonus créatif — rotations à chaque refresh)
+# ═══════════════════════════════════════════════════════════════════════════════
+FUN_FACTS = [
+    ("🌟 SN 2023ixf", "Découverte par un astronome amateur japonais dans M101 à mag ~11 — visible aux jumelles pendant des semaines."),
+    ("💥 Énergie d'une supernova", "En quelques secondes, une supernova libère autant d'énergie que le Soleil en 10 milliards d'années. 99% part en neutrinos."),
+    ("🔭 Apophis 2029", "Le 13 avril 2029, l'astéroïde Apophis (340m) passera à seulement 32 000 km — plus près que certains satellites géostationnaires."),
+    ("☄️ Ceinture de Kuiper", "La ceinture de Kuiper contient plus d'un trillion d'objets. La sonde New Horizons y vogue encore aujourd'hui."),
+    ("🌌 Supernova galactique", "La dernière supernova visible à l'œil nu dans la Voie Lactée date de 1604 (Kepler). La prochaine pourrait être Bételgeuse."),
+    ("🪨 NEOCP", "En moyenne, 5 à 10 nouveaux objets apparaissent chaque jour sur le NEOCP. La plupart disparaissent en 48h une fois leur orbite contrainte."),
+    ("⚡ Vitesse des neutrinos SN", "Les neutrinos de SN 1987A ont atteint la Terre 3 heures AVANT la lumière visible — preuve qu'ils voyagent légèrement plus vite dans le plasma stellaire."),
+    ("🌠 Comète interstellaire", "2I/Borisov (2019) est la première comète interstellaire confirmée — elle venait d'un autre système solaire."),
+    ("🛰️ Vespera II", "Ton Vespera II peut capturer des objets jusqu'à mag ~19 en une nuit — soit des millions de galaxies et d'astéroïdes potentiels."),
+    ("🔴 Bételgeuse", "Bételgeuse a diminué de 35% en luminosité en 2019-2020 (la Grande Diminution). Quand elle explosera, elle sera visible en plein jour."),
+    ("💫 Type Ia standard", "Les supernovæ de type Ia sont des 'chandelles standard' : leur luminosité absolue est connue, ce qui a permis de découvrir l'énergie sombre en 1998."),
+    ("🌍 MOID critique", "Un MOID < 0.05 UA ET H < 22 classe automatiquement un objet comme PHO (Potentially Hazardous Object). Il en existe ~2300 connus."),
+    ("📡 SNEWS", "Le réseau SNEWS (SuperNova Early Warning System) relie des détecteurs de neutrinos mondiaux : il peut alerter les astronomes AVANT qu'une SN galactique soit visible !"),
+    ("🕳️ GW170817", "En 2017, une fusion de deux étoiles à neutrons a été détectée simultanément en ondes gravitationnelles ET en lumière — naissance de l'astronomie multi-messagers."),
+    ("🌊 Kilonova", "Les fusions d'étoiles à neutrons (kilonovæ) sont la principale source d'or, de platine et d'uranium dans l'univers. Chaque bijou en or vient d'une telle explosion."),
+]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CALCUL SCORES
 # ═══════════════════════════════════════════════════════════════════════════════
-def compute_score(h: float, n_obs: int, arc: float, moid: float = 99, neo_score: float = 0) -> float:
-    """
-    Score de dangerosité/intérêt (0–100) enrichi avec les données Scout.
-      H (taille)              : 35 pts  — H<18 → max, H=25 → 0
-      Arc court (incertitude) : 25 pts  — arc<0.5j → max, arc≥30j → 0
-      Peu d'observations      : 20 pts  — ≤5 obs → max, ≥50 → 0
-      MOID proche             : 10 pts  — moid<0.01 UA → max, ≥0.1 → 0
-      Score NEO MPC           : 10 pts  — neoScore 0–100 → 0–10 pts
-    """
+def compute_score(h, n_obs, arc, moid=99, neo_score=0):
     s_h    = max(0.0, min(35.0, (25.0 - h) / 25.0 * 35.0))
     s_arc  = max(0.0, min(25.0, (30.0 - arc) / 30.0 * 25.0))
     s_obs  = max(0.0, min(20.0, (50.0 - n_obs) / 50.0 * 20.0))
@@ -149,9 +226,9 @@ def compute_score(h: float, n_obs: int, arc: float, moid: float = 99, neo_score:
     s_neo  = neo_score / 100.0 * 10.0
     return round(s_h + s_arc + s_obs + s_moid + s_neo, 1)
 
-
-def vespera_score(mag: float) -> tuple:
-    """Score d'observabilité Vespera II (0–100) + label."""
+def vespera_score(mag):
+    try: mag = float(mag)
+    except: return 0, "⛔ Hors portée"
     if mag <= 10:          return 100, "👁️ Trivial"
     if mag <= VESP_SHORT:  return 90,  "🟢 Excellent (10 min)"
     if mag <= VESP_MEDIUM: return 70,  "🟡 Bon (30 min)"
@@ -159,223 +236,385 @@ def vespera_score(mag: float) -> tuple:
     if mag <= VESP_LIMIT:  return 15,  "🔴 Très difficile"
     return 0, "⛔ Hors portée"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# UTILITAIRES
-# ═══════════════════════════════════════════════════════════════════════════════
-def get_trend(name: str, score: float) -> str:
-    h = st.session_state.obj_history.get(name, [])
-    if len(h) < 2: return "➡️"
-    d = score - h[-2]["S"]
-    return "↗️" if d > 0.5 else "↘️" if d < -0.5 else "➡️"
-
-def score_label(s: float) -> str:
+def score_label(s):
     if s >= 80: return "🔴 CRITIQUE"
     if s >= 50: return "🟡 ÉLEVÉ"
     return "🟢 FAIBLE"
 
-def classify_size(h: float) -> str:
+def classify_size(h):
     if h < 18: return ">1 km"
     if h < 22: return "100m–1km"
     if h < 25: return "10–100m"
     return "<10m"
 
-_init('discord_queue', [])  # messages en attente de retry : [(content, attempt, next_try)]
+def get_trend(name, score):
+    h = st.session_state.obj_history.get(name, [])
+    if len(h) < 2: return "➡️"
+    d = score - h[-2]["S"]
+    return "↗️" if d > 0.5 else "↘️" if d < -0.5 else "➡️"
 
+def is_galactic(ra_deg, dec_deg):
+    """Détecte si des coordonnées équatoriales sont proches du plan galactique (|b| < 15°)."""
+    try:
+        ra  = float(ra_deg)
+        dec = float(dec_deg)
+        # Conversion approximative eq → galactique (J2000)
+        ra_r  = math.radians(ra)
+        dec_r = math.radians(dec)
+        ra_gp = math.radians(192.8595)
+        dec_gp= math.radians(27.1284)
+        sin_b = (math.sin(dec_r)*math.sin(dec_gp) +
+                 math.cos(dec_r)*math.cos(dec_gp)*math.cos(ra_r - ra_gp))
+        b = math.degrees(math.asin(max(-1, min(1, sin_b))))
+        return abs(b) < 15, round(b, 1)
+    except:
+        return False, 0
+
+def ra_hms_to_deg(ra_str):
+    """Convertit RA h:m:s.s en degrés."""
+    try:
+        parts = str(ra_str).replace('h',' ').replace('m',' ').replace('s','').split()
+        if len(parts) == 3:
+            h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
+            return (h + m/60 + s/3600) * 15
+        return float(ra_str)
+    except:
+        return None
+
+def dec_dms_to_deg(dec_str):
+    """Convertit DEC d:m:s.s en degrés."""
+    try:
+        dec_str = str(dec_str).strip()
+        sign = -1 if dec_str.startswith('-') else 1
+        dec_str = dec_str.lstrip('+-')
+        parts = dec_str.replace('°',' ').replace("'",' ').replace('"','').split()
+        if len(parts) == 3:
+            d, m, s = float(parts[0]), float(parts[1]), float(parts[2])
+            return sign * (d + m/60 + s/3600)
+        return float(dec_str)
+    except:
+        return None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DISCORD
+# ═══════════════════════════════════════════════════════════════════════════════
 def _discord(content: str):
-    """Envoie sur Discord. Si échec, met en queue pour retry toutes les 60s."""
     ts = datetime.now().strftime("%H:%M:%S")
     prev = content[:90].replace("\n", " ")
     try:
         r = requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=5)
-        if r.status_code in (200, 204):
-            status_str = "✅ OK"
-        else:
-            status_str = f"⚠️ HTTP {r.status_code}"
-            # Mettre en queue pour retry
-            st.session_state.discord_queue.append({
-                "content": content, "attempt": 1,
-                "next_try": datetime.now() + timedelta(seconds=60)
-            })
+        status_str = "✅ OK" if r.status_code in (200, 204) else f"⚠️ HTTP {r.status_code}"
+        if r.status_code not in (200, 204):
+            st.session_state.discord_queue.append({"content": content, "attempt": 1,
+                "next_try": datetime.now() + timedelta(seconds=60)})
     except Exception as e:
         status_str = f"❌ {type(e).__name__}"
-        st.session_state.discord_queue.append({
-            "content": content, "attempt": 1,
-            "next_try": datetime.now() + timedelta(seconds=60)
-        })
+        st.session_state.discord_queue.append({"content": content, "attempt": 1,
+            "next_try": datetime.now() + timedelta(seconds=60)})
     st.session_state.discord_log.append((ts, status_str, prev))
-    if len(st.session_state.discord_log) > 25:
-        st.session_state.discord_log = st.session_state.discord_log[-25:]
-
+    if len(st.session_state.discord_log) > 30:
+        st.session_state.discord_log = st.session_state.discord_log[-30:]
 
 def _process_discord_queue():
-    """Appelé à chaque refresh — retente les messages en échec."""
     now = datetime.now()
     remaining = []
     for item in st.session_state.discord_queue:
         if now < item["next_try"]:
-            remaining.append(item)
-            continue
-        if item["attempt"] >= 5:  # abandon après 5 tentatives
-            ts = now.strftime("%H:%M:%S")
-            st.session_state.discord_log.append((ts, "❌ Abandon (5 essais)", item["content"][:60]))
-            continue
+            remaining.append(item); continue
+        if item["attempt"] >= 5:
+            st.session_state.discord_log.append((now.strftime("%H:%M:%S"),
+                "❌ Abandon", item["content"][:60])); continue
         try:
             r = requests.post(DISCORD_WEBHOOK, json={"content": item["content"]}, timeout=5)
             if r.status_code in (200, 204):
-                ts = now.strftime("%H:%M:%S")
-                st.session_state.discord_log.append((ts, f"✅ Retry#{item['attempt']} OK", item["content"][:60]))
-                # Succès → ne pas remettre en queue
+                st.session_state.discord_log.append((now.strftime("%H:%M:%S"),
+                    f"✅ Retry#{item['attempt']}", item["content"][:60]))
             else:
-                item["attempt"] += 1
-                item["next_try"] = now + timedelta(seconds=60)
+                item["attempt"] += 1; item["next_try"] = now + timedelta(seconds=60)
                 remaining.append(item)
-        except Exception:
-            item["attempt"] += 1
-            item["next_try"] = now + timedelta(seconds=60)
+        except:
+            item["attempt"] += 1; item["next_try"] = now + timedelta(seconds=60)
             remaining.append(item)
     st.session_state.discord_queue = remaining
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FETCH "PREVIOUS NEOCP" — Source la plus fiable pour les désignations officielles
-# La page MPC liste tous les objets retirés du NEOCP avec leur désignation officielle
-# C'est exactement ce qu'on voit dans la capture : "Moved to PCCP", "Designated 2026 XY1"...
+# FETCH SUPERNOVÆ — Rochester Astronomy (scraping HTML)
+# Source la plus complète et publique, mise à jour quotidiennement
+# Fallback sur TNS search si Rochester indisponible
+# ═══════════════════════════════════════════════════════════════════════════════
+def fetch_supernovae(max_mag: float = 99.0) -> pd.DataFrame:
+    """
+    Parse rochesterastronomy.org/supernova.html pour récupérer toutes les SN récentes.
+    Extrait : nom, R.A., Déc., magnitude, type, galaxie hôte, date découverte.
+    Enrichit avec : score Vespera, détection galactique, type info, lien TNS.
+    """
+    now = datetime.now()
+    td = (now - st.session_state.last_sn_req).total_seconds()
+    if td < 1800 and not st.session_state.sn_cache.empty:
+        return st.session_state.sn_cache.copy()
+
+    rows = []
+    urls = [ROCHESTER_SN, ROCHESTER_SN26]
+
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=10, headers={"User-Agent": "DeepSpaceRadar/28"})
+            if r.status_code != 200: continue
+            html = r.text
+
+            # Patterns Rochester : chaque SN = ligne avec nom, coordonnées, mag, type, host
+            # Format typique : "SN 2026kid ... R.A. = 15h16m... Decl. = +56°... Mag 15.0 Type II host NGC 5907"
+            # On parse le texte brut extrait du HTML
+            text = re.sub(r'<[^>]+>', ' ', html)
+            text = re.sub(r'\s+', ' ', text)
+
+            # Pattern 1 : entrées structurées "2026xxx ... R.A. = HHhMMmSS.ss Decl. = ±DD°MM'SS" 
+            pattern = re.compile(
+                r'((?:SN|AT)\s*20\d{2}\w+)'      # nom SN
+                r'.*?R\.A\.\s*=\s*([\d:h\s]+[ms]?[\d.]*)'  # RA
+                r'.*?Decl\.\s*=\s*([+\-][\d°\'".\s]+)'     # Dec
+                r'.*?Mag\s+([\d.]+)'              # magnitude
+                r'(?:.*?Type\s+([A-Za-z\-IVab]+))?'        # type
+                r'(?:.*?host\s+([\w\s]+?))?'      # host galaxy
+                r'(?=SN|AT|$)',
+                re.DOTALL | re.IGNORECASE
+            )
+            for m in pattern.finditer(text[:50000]):
+                try:
+                    nom  = m.group(1).strip().replace(' ', '')
+                    ra_s = m.group(2).strip()
+                    dec_s= m.group(3).strip()
+                    mag  = float(m.group(4))
+                    sn_t = (m.group(5) or "?").strip()
+                    host = (m.group(6) or "?").strip()[:40]
+                    ra_deg  = ra_hms_to_deg(ra_s)
+                    dec_deg = dec_dms_to_deg(dec_s)
+                    if ra_deg is None or dec_deg is None: continue
+                    galactic, b_lat = is_galactic(ra_deg, dec_deg)
+                    vs, vl = vespera_score(mag)
+                    ti = sn_type_info(sn_t)
+                    rows.append({
+                        "Nom": nom, "Type": sn_t, "Type emoji": ti["emoji"],
+                        "Type desc": ti["desc"], "Durée": ti["duree"],
+                        "Mag": mag, "Vespera": vs, "Obs. Vespera": vl,
+                        "Galaxie hôte": host, "RA (°)": round(ra_deg, 4),
+                        "DEC (°)": round(dec_deg, 4), "Lat. gal. (°)": b_lat,
+                        "Galactique ?": "🌌 OUI !!!" if galactic else "Non",
+                        "Lien TNS": f"https://www.wis-tns.org/object/{nom.replace('SN','').replace('AT','').strip()}",
+                        "Lien Rochester": f"https://rochesterastronomy.org/sn2026/{nom.lower()}.html",
+                        "Source": url.split('/')[-1],
+                    })
+                except: continue
+
+            # Pattern 2 : format plus simple sans RA/Dec explicite
+            # "discovered 2026/MM/DD.ddd at R.A. = HHhMMmSS.ss, Decl. = ±DD°MM'SS.ss Mag MM.m:M/D, Type XXX (host GALAXY)"
+            pattern2 = re.compile(
+                r'((?:AT|SN)20\d{2}\w+)'
+                r'.*?discovered\s+[\d/]+\s+at\s+R\.A\.\s*=\s*([\d]+h[\d]+m[\d.]+s?)'
+                r',\s*Decl\.\s*=\s*([+\-]?\d+°[\d\'".]+)'
+                r'\s+Mag\s+([\d.]+)[\d:/,]*'
+                r'.*?Type\s+([A-Za-z\-]+)'
+                r'(?:.*?\(host\s+(.*?)\))?',
+                re.IGNORECASE
+            )
+            for m in pattern2.finditer(text[:100000]):
+                try:
+                    nom = m.group(1).strip()
+                    if any(r["Nom"] == nom for r in rows): continue
+                    ra_deg  = ra_hms_to_deg(m.group(2))
+                    dec_deg = dec_dms_to_deg(m.group(3))
+                    mag     = float(m.group(4))
+                    sn_t    = m.group(5).strip()
+                    host    = (m.group(6) or "?").strip()[:40]
+                    if ra_deg is None or dec_deg is None: continue
+                    galactic, b_lat = is_galactic(ra_deg, dec_deg)
+                    vs, vl = vespera_score(mag)
+                    ti = sn_type_info(sn_t)
+                    rows.append({
+                        "Nom": nom, "Type": sn_t, "Type emoji": ti["emoji"],
+                        "Type desc": ti["desc"], "Durée": ti["duree"],
+                        "Mag": mag, "Vespera": vs, "Obs. Vespera": vl,
+                        "Galaxie hôte": host, "RA (°)": round(ra_deg, 4),
+                        "DEC (°)": round(dec_deg, 4), "Lat. gal. (°)": b_lat,
+                        "Galactique ?": "🌌 OUI !!!" if galactic else "Non",
+                        "Lien TNS": f"https://www.wis-tns.org/object/{nom.replace('SN','').replace('AT','').strip()}",
+                        "Lien Rochester": f"https://rochesterastronomy.org/sn2026/{nom.lower()}.html",
+                        "Source": url.split('/')[-1],
+                    })
+                except: continue
+
+        except Exception:
+            continue
+
+    # Fallback minimal : parser le texte brut Rochester pour les entrées simples
+    if not rows:
+        try:
+            r = requests.get(ROCHESTER_SN, timeout=10, headers={"User-Agent": "DSR/28"})
+            text = re.sub(r'<[^>]+>', ' ', r.text)
+            # Chercher toute ligne avec "SN 20xxyyy ... Mag N.N"
+            for m in re.finditer(r'((?:SN|AT)\s?20\d{2}\w{1,6}).*?Mag\s+([\d.]+)', text[:80000]):
+                try:
+                    nom = m.group(1).replace(' ', '')
+                    mag = float(m.group(2))
+                    vs, vl = vespera_score(mag)
+                    ti = sn_type_info("?")
+                    rows.append({"Nom": nom, "Type": "?", "Type emoji": "❓",
+                                 "Type desc": "?", "Durée": "?",
+                                 "Mag": mag, "Vespera": vs, "Obs. Vespera": vl,
+                                 "Galaxie hôte": "?", "RA (°)": None, "DEC (°)": None,
+                                 "Lat. gal. (°)": None, "Galactique ?": "?",
+                                 "Lien TNS": f"https://www.wis-tns.org/object/{nom[2:]}",
+                                 "Lien Rochester": ROCHESTER_SN, "Source": "fallback"})
+                except: continue
+        except: pass
+
+    if not rows:
+        return st.session_state.sn_cache.copy()
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["Nom"])
+    df = df.sort_values("Mag", ascending=True)
+
+    # Historique des magnitudes (suivi de l'évolution)
+    for _, row in df.iterrows():
+        nm = row["Nom"]
+        if nm not in st.session_state.sn_history:
+            st.session_state.sn_history[nm] = []
+        st.session_state.sn_history[nm].append({
+            "T": now.strftime("%H:%M"), "Mag": row["Mag"]
+        })
+        if len(st.session_state.sn_history[nm]) > 48:
+            st.session_state.sn_history[nm].pop(0)
+
+    st.session_state.sn_cache = df
+    st.session_state.last_sn_req = now
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALERTES SUPERNOVÆ — Discord
+# ═══════════════════════════════════════════════════════════════════════════════
+def alert_supernovae(df_sn: pd.DataFrame):
+    """Génère des alertes Discord pour les supernovæ notables."""
+    if df_sn.empty: return
+    events = []
+
+    for _, row in df_sn.iterrows():
+        nom  = row["Nom"]
+        mag  = row["Mag"]
+        snt  = row.get("Type", "?")
+        host = row.get("Galaxie hôte", "?")
+        vs   = row.get("Vespera", 0)
+        vl   = row.get("Obs. Vespera", "?")
+        gal  = row.get("Galactique ?", "Non")
+        lat  = row.get("Lat. gal. (°)", "?")
+
+        # 🚨 ALERTE MAXIMALE : supernova galactique (événement du siècle)
+        if "OUI" in str(gal) and nom not in st.session_state.alerted_galactic:
+            events.append(
+                f"🚨🌌 **SUPERNOVA GALACTIQUE DÉTECTÉE !!!**\n"
+                f"   Nom : `{nom}` | Magnitude : **{mag}**\n"
+                f"   Latitude galactique : **b = {lat}°** (< 15° = plan galactique)\n"
+                f"   Hôte : {host}\n"
+                f"   Type : {row.get('Type emoji','')} {snt}\n"
+                f"   🔭 Vespera II : {vl}\n"
+                f"   ⚠️ ÉVÉNEMENT ASTRONOMIQUE EXCEPTIONNEL — 1 fois par siècle !"
+            )
+            st.session_state.alerted_galactic.add(nom)
+
+        # 🌟 Nouvelle SN dans portée Vespera
+        if vs >= 45 and nom not in st.session_state.alerted_sn_vespera:
+            events.append(
+                f"🌟 **SUPERNOVA OBSERVABLE VESPERA II :**\n"
+                f"   `{nom}` ({row.get('Type emoji','')} {snt}) | Mag **{mag}**\n"
+                f"   Hôte : {host}\n"
+                f"   Score Vespera : {vs}/100 → {vl}\n"
+                f"   🔗 TNS : {row.get('Lien TNS','')}"
+            )
+            st.session_state.alerted_sn_vespera.add(nom)
+
+        # 🔔 Nouvelle SN tout court (jamais alertée)
+        elif nom not in st.session_state.alerted_sn:
+            if mag <= 19.0:  # seulement les SN accessibles aux petits instruments
+                events.append(
+                    f"🔔 **NOUVELLE SN DÉTECTÉE :** `{nom}` ({snt})\n"
+                    f"   Mag {mag} | Hôte : {host} | Vespera : {vl}"
+                )
+            st.session_state.alerted_sn.add(nom)
+
+    if events:
+        _discord("🌟 **RADAR SUPERNOVÆ**\n" + "\n".join(events))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FETCH NEOCP PREVIOUS
 # ═══════════════════════════════════════════════════════════════════════════════
 def fetch_prev_neocp() -> dict:
-    """
-    Récupère la liste des objets récemment retirés du NEOCP via la page HTML MPC.
-    On parse le tableau HTML pour extraire : tdes temporaire → désignation officielle + raison.
-    Refresh : toutes les 10 minutes max (données semi-statiques).
-    Retourne un dict : {tdes: {designation, reason, date}}
-    """
     now = datetime.now()
     td = (now - st.session_state.last_prev_req).total_seconds()
     if td < 600 and st.session_state.prev_neocp_cache:
         return st.session_state.prev_neocp_cache
-
     result = {}
-    # URL de la page "Elsewhere" (Previous NEOCP objects) — liste avec raisons de retrait
     urls_to_try = [
-        "https://www.minorplanetcenter.net/iau/NEO/pccp_tabular.html",  # PCCP → comètes potentielles
-        "https://www.minorplanetcenter.net/iau/NEO/toconfirm_tabular.html",  # NEOCP principal
+        "https://www.minorplanetcenter.net/iau/NEO/pccp_tabular.html",
+        "https://www.minorplanetcenter.net/iau/NEO/toconfirm_tabular.html",
     ]
     for url in urls_to_try:
         try:
-            r = requests.get(url, timeout=6, headers={"User-Agent": "DeepSpaceRadar/27"})
-            if r.status_code != 200:
-                continue
+            r = requests.get(url, timeout=6, headers={"User-Agent": "DeepSpaceRadar/28"})
+            if r.status_code != 200: continue
             html = r.text
-            # Chercher les patterns de désignation : "Moved to PCCP", "Designated YYYY XY1", etc.
-            # Patterns dans le HTML MPC :
-            # - Lignes avec un tdes + "Moved to the PCCP" → objet possible comète
-            # - Lignes avec un tdes + une désignation officielle type "2026 AB1"
-            # Pattern tdes MPC : lettres+chiffres, typiq. 6-8 chars (ex: C1EN9T5, A11BRI6)
-            # Désignation officielle : "YYYY Xnn" ou numéro
-            import re as _re
-            # Chercher les paires (tdes temporaire, désignation)
-            # Dans le HTML brut, chaque ligne ressemble à :
-            # <tr><td>C1EN9T5</td><td>...</td><td>Moved to the PCCP</td>...</tr>
-            rows_html = _re.findall(r'<tr[^>]*>(.*?)</tr>', html, _re.DOTALL | _re.IGNORECASE)
+            rows_html = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
             for row in rows_html:
-                cells = _re.findall(r'<td[^>]*>(.*?)</td>', row, _re.DOTALL | _re.IGNORECASE)
-                cells = [_re.sub(r'<[^>]+>', '', c).strip() for c in cells]
-                if len(cells) < 2:
-                    continue
+                cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+                cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+                if len(cells) < 2: continue
                 tdes_cand = cells[0].strip()
-                # Valider que c'est un tdes MPC (6-8 chars alphanumériques)
-                if not tdes_cand or not _re.match(r'^[A-Za-z0-9]{4,10}$', tdes_cand):
-                    continue
+                if not tdes_cand or not re.match(r'^[A-Za-z0-9]{4,10}$', tdes_cand): continue
                 reason = " ".join(cells).strip()
-                # Chercher une désignation officielle dans les cellules
                 designation = None
                 for cell in cells[1:]:
-                    # Désignation provisoire : "2026 AB1", "2025 YR4", etc.
-                    m = _re.search(r'\b(20\d{2}\s+[A-Z]{1,2}\d{1,4})\b', cell)
-                    if m:
-                        designation = m.group(1)
-                        break
-                    # Désignation numérotée : "(12345)"
-                    m2 = _re.search(r'\((\d{4,6})\)', cell)
-                    if m2:
-                        designation = m2.group(1)
-                        break
-                    # "Moved to PCCP" → objet potentiellement cométaire
+                    m = re.search(r'\b(20\d{2}\s+[A-Z]{1,2}\d{1,4})\b', cell)
+                    if m: designation = m.group(1); break
+                    m2 = re.search(r'\((\d{4,6})\)', cell)
+                    if m2: designation = m2.group(1); break
                     if 'pccp' in cell.lower() or 'comet' in cell.lower():
-                        designation = f"[PCCP] {tdes_cand}"
-                        break
-
+                        designation = f"[PCCP] {tdes_cand}"; break
                 if designation or 'moved' in reason.lower() or 'designated' in reason.lower():
-                    result[tdes_cand] = {
-                        "designation": designation or "?",
-                        "reason": reason[:80],
-                        "date": now.strftime("%Y-%m-%d %H:%M"),
-                        "source": url.split('/')[-1],
-                    }
-        except Exception:
-            continue
-
+                    result[tdes_cand] = {"designation": designation or "?",
+                                         "reason": reason[:80],
+                                         "date": now.strftime("%Y-%m-%d %H:%M"),
+                                         "source": url.split('/')[-1]}
+        except: continue
     if result:
-        # Fusionner avec le cache existant (les anciens restent)
         merged = {**st.session_state.prev_neocp_cache, **result}
         st.session_state.prev_neocp_cache = merged
         st.session_state.last_prev_req = now
-
     return st.session_state.prev_neocp_cache
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DÉTECTION TRANSITION NEOCP → NASA  (algorithme principal)
+# DÉTECTION TRANSITIONS
 # ═══════════════════════════════════════════════════════════════════════════════
-def detect_transitions(prev_noms: set, cur_noms: set, df_nasa: pd.DataFrame) -> list:
-    """
-    Stratégie multi-couches pour détecter qu'un objet NEOCP a été officiellement désigné :
-
-    1. SCOUT-SBDB direct : quand un objet disparaît de Scout, on tente immédiatement
-       une requête SBDB avec son tdes — si NASA le connaît → désignation trouvée.
-
-    2. Correspondance orbitale avec NASA CAD : si l'objet disparu a des caractéristiques
-       orbitales enregistrées (H, q, e) similaires à un objet NASA CAD récemment apparu,
-       on matche avec un score de similarité.
-
-    3. Correspondance temporelle : si l'objet disparaît dans la fenêtre de temps
-       couverte par le CAD, il est probablement dedans.
-
-    Retourne une liste de dicts {tdes, nom_officiel, methode, details}.
-    """
+def detect_transitions(prev_noms, cur_noms, df_nasa):
     gone = prev_noms - cur_noms
-    if not gone:
-        return []
-
+    if not gone: return []
     transitions = []
-    nasa_des_list = df_nasa['des'].tolist() if not df_nasa.empty and 'des' in df_nasa.columns else []
-    # Récupérer la liste des retraits MPC (refresh max toutes les 10 min)
     prev_neocp = fetch_prev_neocp()
-
     for tdes in gone:
-        if tdes in st.session_state.alerted_gone:
-            continue
-
+        if tdes in st.session_state.alerted_gone: continue
         result = {"tdes": tdes, "nom_officiel": None, "methode": None, "details": {}}
-
-        # ── Méthode 0 : Page "Previous NEOCP" MPC — source officielle ──
-        # C'est exactement ce qu'affiche la capture : "Moved to PCCP", désignations officielles
         if tdes in prev_neocp:
             info_prev = prev_neocp[tdes]
             desig = info_prev.get("designation", "?")
             reason = info_prev.get("reason", "?")
             is_pccp = desig.startswith("[PCCP]")
-            result["nom_officiel"] = desig if not is_pccp else f"Comète potentielle (PCCP)"
+            result["nom_officiel"] = desig if not is_pccp else "Comète potentielle (PCCP)"
             result["methode"] = "Page MPC Previous NEOCP (officielle)"
-            result["details"] = {
-                "Désignation": desig,
-                "Raison MPC":  reason[:60],
-                "Confiance":   "✅ Officielle (source MPC directe)",
-                "PCCP":        "Oui — probablement une comète" if is_pccp else "Non",
-            }
+            result["details"] = {"Désignation": desig, "Raison MPC": reason[:60],
+                                  "Confiance": "✅ Officielle", "PCCP": "Oui" if is_pccp else "Non"}
             transitions.append(result)
             st.session_state.alerted_gone.add(tdes)
             continue
-
-
         try:
             r = requests.get(NASA_SBDB, params={"sstr": tdes, "phys-par": "1"}, timeout=5)
             data = r.json()
@@ -387,22 +626,15 @@ def detect_transitions(prev_noms: set, cur_noms: set, df_nasa: pd.DataFrame) -> 
                 if isinstance(elems, list):
                     elems = {e["name"]: e.get("value") for e in elems}
                 result["nom_officiel"] = obj.get("fullname", obj.get("des", "?"))
-                result["methode"]      = "SBDB direct (tdes trouvé)"
-                result["details"]      = {
-                    "H":    phy.get("H", "?"),
-                    "q":    elems.get("q", "?"),
-                    "e":    elems.get("e", "?"),
-                    "i":    elems.get("i", "?"),
-                    "classe": obj.get("orbit_class", {}).get("name", "?"),
-                    "neo":  "✅" if obj.get("neo") else "❌",
-                }
+                result["methode"] = "SBDB direct (tdes trouvé)"
+                result["details"] = {"H": phy.get("H","?"), "q": elems.get("q","?"),
+                                      "e": elems.get("e","?"), "i": elems.get("i","?"),
+                                      "classe": obj.get("orbit_class",{}).get("name","?"),
+                                      "neo": "✅" if obj.get("neo") else "❌"}
                 transitions.append(result)
                 st.session_state.alerted_gone.add(tdes)
                 continue
-        except Exception:
-            pass
-
-        # ── Méthode 2 : Correspondance H similaire dans NASA CAD (fenêtre ±0.5 mag) ──
+        except: pass
         hist = st.session_state.obj_history.get(tdes, [])
         if hist and not df_nasa.empty and 'h' in df_nasa.columns:
             h_ref = hist[-1].get("H")
@@ -413,80 +645,66 @@ def detect_transitions(prev_noms: set, cur_noms: set, df_nasa: pd.DataFrame) -> 
                     candidates = df_n[abs(df_n['h_num'] - h_ref) < 0.5]
                     if not candidates.empty:
                         best = candidates.iloc[0]
-                        result["nom_officiel"] = best.get("des", best.get("fullname", "?"))
-                        result["methode"]      = f"Correspondance H={h_ref:.1f}±0.5 dans NASA CAD"
-                        result["details"]      = {
-                            "H NASA":  best.get("h", "?"),
-                            "dist":    best.get("dist", "?"),
-                            "date":    best.get("cd", "?"),
-                            "confiance": "Moyenne (H similaire)"
-                        }
+                        result["nom_officiel"] = best.get("des", "?")
+                        result["methode"] = f"Correspondance H={h_ref:.1f}±0.5 dans NASA CAD"
+                        result["details"] = {"H NASA": best.get("h","?"), "dist": best.get("dist","?"),
+                                              "date": best.get("cd","?"), "confiance": "Moyenne"}
                         transitions.append(result)
                         st.session_state.alerted_gone.add(tdes)
                         continue
-                except Exception:
-                    pass
-
-        # ── Méthode 3 : Disparu sans correspondance — fausse alerte / non confirmé ──
+                except: pass
         result["nom_officiel"] = None
-        result["methode"]      = "Retiré du NEOCP (non confirmé)"
-        result["details"]      = {"raison": "Orbite non contrainte, fausse détection, ou objet artificiel"}
+        result["methode"] = "Retiré du NEOCP (non confirmé)"
+        result["details"] = {"raison": "Orbite non contrainte, fausse détection, ou objet artificiel"}
         transitions.append(result)
         st.session_state.alerted_gone.add(tdes)
-
     return transitions
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# ALERTES DISCORD
+# ALERTES NÉOS DISCORD
 # ═══════════════════════════════════════════════════════════════════════════════
-def monitor_and_alert(df_anom: pd.DataFrame, df_nasa: pd.DataFrame, transitions: list):
+def monitor_and_alert(df_anom, df_nasa, transitions):
     now = datetime.now()
     cur_noms = set(df_anom['Nom'].tolist()) if not df_anom.empty else set()
     events = []
 
-    # 1. Nouveaux objets
     new_objs = cur_noms - st.session_state.alerted_new
     for n in new_objs:
         row = df_anom[df_anom['Nom'] == n].iloc[0]
-        events.append(f"🆕 **NOUVEL OBJET :** `{n}` — H={row.get('H','?')} | Vmag={row.get('Vmag','?')} | Score={row['Score']}")
+        vs, vl = vespera_score(row.get('Vmag', 99))
+        events.append(f"🆕 **NOUVEL OBJET :** `{n}` | H={row.get('H','?')} "
+                      f"| Vmag={row.get('Vmag','?')} | Score={row['Score']} | Vespera: {vl}")
     st.session_state.alerted_new.update(new_objs)
 
-    # 2. Transitions (résultat de detect_transitions)
     for t in transitions:
-        tdes = t["tdes"]
-        nom  = t["nom_officiel"]
-        meth = t["methode"]
+        tdes = t["tdes"]; nom = t["nom_officiel"]; meth = t["methode"]
         if nom:
-            msg = (f"🎯 **DÉSIGNÉ OFFICIELLEMENT :** `{tdes}` → `{nom}`\n"
-                   f"   Méthode : {meth}\n"
-                   f"   Détails : {t['details']}")
-            events.append(msg)
+            events.append(f"🎯 **DÉSIGNÉ :** `{tdes}` → `{nom}`\n   Méthode : {meth}\n   {t['details']}")
             st.session_state.recognized_objects[tdes] = {
-                "nom_officiel": nom, "methode": meth,
-                "details": t["details"], "date": now.strftime("%Y-%m-%d %H:%M")
-            }
+                "nom_officiel": nom, "methode": meth, "details": t["details"],
+                "date": now.strftime("%Y-%m-%d %H:%M")}
         else:
-            events.append(f"👻 **DISPARU :** `{tdes}` retiré du NEOCP — {t['details'].get('raison','')}")
+            events.append(f"👻 **DISPARU :** `{tdes}` — {t['details'].get('raison','')}")
 
-    # 3. Seuils de score avec reset
     if not df_anom.empty:
         for r in df_anom.itertuples():
             palier = st.session_state.score_palier.get(r.Nom)
             tr = get_trend(r.Nom, r.Score)
+            vs, vl = vespera_score(getattr(r, 'Vmag', 99))
             if r.Score >= 80 and palier != 80:
-                events.append(f"🚨 **CRITIQUE ≥80 :** `{r.Nom}` {tr} Score={r.Score} | H={getattr(r,'H','?')}")
+                events.append(f"🚨 **CRITIQUE ≥80 :** `{r.Nom}` {tr} Score={r.Score} | H={getattr(r,'H','?')} | Vespera: {vl}")
                 st.session_state.score_palier[r.Nom] = 80
             elif 50 <= r.Score < 80 and palier not in (50, 80):
-                events.append(f"🔥 **SEUIL ≥50 :** `{r.Nom}` {tr} Score={r.Score}")
+                events.append(f"🔥 **SEUIL ≥50 :** `{r.Nom}` {tr} Score={r.Score} | Vespera: {vl}")
                 st.session_state.score_palier[r.Nom] = 50
             elif 50 <= r.Score < 80 and palier == 80:
                 st.session_state.score_palier[r.Nom] = 50
             elif r.Score < 50:
                 if palier in (50, 80):
-                    events.append(f"📉 **RETOMBÉ :** `{r.Nom}` Score={r.Score} (alerte réinitialisée)")
+                    events.append(f"📉 **RETOMBÉ :** `{r.Nom}` Score={r.Score}")
                 st.session_state.score_palier[r.Nom] = None
 
-    # 4. Changement Top 5
     if not df_anom.empty:
         new_top5 = df_anom.sort_values("Score", ascending=False).head(5)['Nom'].tolist()
         if st.session_state.prev_top5 and new_top5 != st.session_state.prev_top5:
@@ -497,65 +715,49 @@ def monitor_and_alert(df_anom: pd.DataFrame, df_nasa: pd.DataFrame, transitions:
                 for i, n in enumerate(new_top5, 1):
                     s = df_anom[df_anom['Nom'] == n]['Score'].values[0]
                     msg += f"  {i}. `{n}` (Score: {s})\n"
-                if entrants: msg += f"  ↑ Entrants : `{', '.join(entrants)}`\n"
-                if sortants:  msg += f"  ↓ Sortants : `{', '.join(sortants)}`"
+                if entrants: msg += f"  ↑ `{', '.join(entrants)}`\n"
+                if sortants:  msg += f"  ↓ `{', '.join(sortants)}`"
                 events.append(msg)
         st.session_state.prev_top5 = new_top5
 
     if events:
         _discord("📡 **RADAR SENTINELLE**\n" + "\n".join(events))
 
-    # 5. Bilan horaire
     if (now - st.session_state.last_alert_time).total_seconds() > 3600:
         msg = f"📊 **BILAN HORAIRE ({now.strftime('%H:%M')})**\n"
         if not df_anom.empty:
             for row in df_anom.sort_values("Score", ascending=False).head(10).itertuples():
-                msg += f"- `{row.Nom}` {get_trend(row.Nom, row.Score)} S={row.Score} H={getattr(row,'H','?')}\n"
+                vs2, vl2 = vespera_score(getattr(row, 'Vmag', 99))
+                msg += f"- `{row.Nom}` {get_trend(row.Nom, row.Score)} S={row.Score} H={getattr(row,'H','?')} | {vl2}\n"
         else:
             msg += "Aucune anomalie active."
         _discord(msg)
         st.session_state.last_alert_time = now
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# ACQUISITION
+# FETCH SCOUT
 # ═══════════════════════════════════════════════════════════════════════════════
 def fetch_scout() -> pd.DataFrame:
-    """
-    API NASA Scout (mode S) : liste tous les objets NEOCP actifs.
-    Retourne le cache immédiatement si < 60s, sinon tente une mise à jour
-    en arrière-plan avec timeout court pour ne pas bloquer l'UI.
-    """
     now = datetime.now()
     time_diff = (now - st.session_state.last_scout_req).total_seconds()
     if time_diff < 60 and not st.session_state.scout_cache.empty:
         return st.session_state.scout_cache.copy()
-
     df = pd.DataFrame()
     try:
-        res = requests.get(SCOUT_API, timeout=8)   # timeout court : 8s max
+        res = requests.get(SCOUT_API, timeout=8)
         res.raise_for_status()
         raw = res.json()
-        # Mode S (liste complète) : Scout retourne directement une liste JSON à la racine
-        # Ex: [{"objectName":"A11BRI6","H":"20.3","nObs":"4",...}, ...]
-        # Certaines versions encapsulent dans {"data":[...], "signature":{...}}
-        if isinstance(raw, list):
-            data_list = raw
+        if isinstance(raw, list): data_list = raw
         elif isinstance(raw, dict):
-            # Chercher la liste dans tous les champs possibles
             data_list = None
             for key in ("data", "result", "objects", "neocp"):
                 if key in raw and isinstance(raw[key], list):
-                    data_list = raw[key]
-                    break
+                    data_list = raw[key]; break
             if data_list is None:
-                # Dernière chance : si le dict lui-même est un objet unique
                 data_list = [raw] if "objectName" in raw or "tdes" in raw else []
-        else:
-            data_list = []
-
-        if not data_list:
-            return st.session_state.scout_cache.copy()
-
+        else: data_list = []
+        if not data_list: return st.session_state.scout_cache.copy()
         rows = []
         for obj in data_list:
             try:
@@ -572,114 +774,73 @@ def fetch_scout() -> pd.DataFrame:
                 ra      = obj.get("ra", "?")
                 dec     = obj.get("dec", "?")
                 elong   = obj.get("elong", "?")
-                rate    = obj.get("rate", "?")   # vitesse angulaire "/min
-                unc     = obj.get("unc", "?")    # incertitude position "
+                rate    = obj.get("rate", "?")
+                unc     = obj.get("unc", "?")
                 last    = obj.get("lastRun", "?")
-
-                # Dériver le type d'objet depuis les scores Scout
-                # tisserandScore > 0 → probable comète ; ieoScore → IEO ; geocentricScore → satellite
-                tiss   = float(obj.get("tisserandScore", 0))
-                geo_sc = float(obj.get("geocentricScore", 0))
-                ieo_sc = float(obj.get("ieoScore", 0))
-                if tiss > 50:
-                    obj_type = "🌠 Comète prob."
-                elif geo_sc > 50:
-                    obj_type = "🛰️ Satellite art."
-                elif ieo_sc > 50:
-                    obj_type = "🌍 IEO (inner)"
-                elif neo_sc >= 80:
-                    obj_type = "☄️ NEO candidat"
-                else:
-                    obj_type = "🪨 Indéterminé"
-
-                # Objets "déjà catalogués" : bien connus, peu d'intérêt pour suivi NEOCP
-                # Critère : score NEO ~0 ET beaucoup d'obs ET arc long → à envoyer dans catalogués
+                tiss    = float(obj.get("tisserandScore", 0))
+                geo_sc  = float(obj.get("geocentricScore", 0))
+                ieo_sc  = float(obj.get("ieoScore", 0))
+                if tiss > 50:   obj_type = "🌠 Comète prob."
+                elif geo_sc > 50: obj_type = "🛰️ Satellite art."
+                elif ieo_sc > 50: obj_type = "🌍 IEO (inner)"
+                elif neo_sc >= 80: obj_type = "☄️ NEO candidat"
+                else: obj_type = "🪨 Indéterminé"
                 is_catalogued = (neo_sc < 10 and n_obs > 15 and arc > 3.0)
-
                 score = compute_score(h_val, n_obs, arc, moid, neo_sc)
-
+                vs, vl = vespera_score(vmag)
                 rows.append({
-                    "Nom":         tdes,
-                    "Type":        obj_type,
-                    "H":           round(h_val, 1),
-                    "Vmag":        round(vmag, 1),
-                    "NObs":        n_obs,
-                    "Arc (j)":     round(arc, 2),
-                    "MOID (UA)":   round(moid, 4) if moid < 99 else ">0.1",
+                    "Nom": tdes, "Type": obj_type, "H": round(h_val, 1),
+                    "Vmag": round(vmag, 1), "NObs": n_obs, "Arc (j)": round(arc, 2),
+                    "MOID (UA)": round(moid, 4) if moid < 99 else ">0.1",
                     "CA min (LD)": round(ca_dist, 3) if ca_dist < 99 else "?",
-                    "Vit. ∞":      v_inf,
-                    "R.A.":        ra,
-                    "Déc.":        dec,
-                    "Élong.":      elong,
-                    "Rate \"/m":   rate,
-                    "Unc. \"":     unc,
-                    "Score NEO":   int(neo_sc),
-                    "Score":       score,
-                    "Statut":      score_label(score),
-                    "Taille":      classify_size(h_val),
-                    "MàJ":         last,
+                    "Vit. ∞": v_inf, "R.A.": ra, "Déc.": dec,
+                    "Élong.": elong, "Rate \"/m": rate, "Unc. \"": unc,
+                    "Score NEO": int(neo_sc), "Score": score,
+                    "Statut": score_label(score), "Taille": classify_size(h_val),
+                    "Vespera": vs, "Obs. Vespera": vl, "MàJ": last,
                     "_catalogued": is_catalogued,
                 })
-            except Exception:
-                continue
-
+            except: continue
         if rows:
             df = pd.DataFrame(rows)
-            # Ne pas stocker les archivés dans le cache non plus
             df = df[~df['Nom'].isin(st.session_state.archived)]
             st.session_state.scout_cache = df
             st.session_state.last_scout_req = now
         elif not st.session_state.scout_cache.empty:
             df = st.session_state.scout_cache.copy()
             df = df[~df['Nom'].isin(st.session_state.archived)]
-
-    except Exception:
-        # Fallback : MPC NEOCP .txt si Scout API inaccessible
-        # Format .txt : colonnes séparées par espaces, header sur ligne 1
-        # Temp Desig | Score | Discovery | R.A. | Decl. | V | Updated | Note | NObs | Arc | H | Not Seen/dys
-        # (correspond exactement à la capture d'écran de l'utilisateur)
+    except:
         try:
             resp = requests.get("https://minorplanetcenter.net/iau/NEO/neocp.txt", timeout=12)
             rows = []
-            lines = resp.text.strip().split('\n')
-            for line in lines:
+            for line in resp.text.strip().split('\n'):
                 parts = line.split()
-                if len(parts) < 10 or parts[0] in ('Temp', 'Score', '---'):
-                    continue
+                if len(parts) < 10 or parts[0] in ('Temp', 'Score', '---'): continue
                 try:
-                    tdes  = parts[0]
-                    # V (magnitude visuelle) est col 5 (0-indexé)
-                    vmag  = float(parts[5]) if len(parts) > 5 else 99.0
-                    # NObs est l'avant-dernière colonne numérique avant Arc et H
-                    # D'après capture : Temp Desig | Score | Discovery | R.A.(2) | Decl.(2) | V | Updated(3) | Note | NObs | Arc | H | Not Seen
-                    # On cherche H et Arc depuis la fin
-                    h_val  = float(parts[-2])
-                    n_arc  = float(parts[-3])
-                    n_obs  = int(float(parts[-4]))
-                    score  = compute_score(h_val, n_obs, n_arc, 99, 0)
-                    rows.append({
-                        "Nom": tdes, "H": round(h_val,1), "Vmag": round(vmag,1),
-                        "NObs": n_obs, "Arc (j)": round(n_arc,2),
-                        "MOID (UA)": ">0.1", "CA min (LD)": "?",
-                        "Vit. ∞": "?", "R.A.": "?", "Déc.": "?",
-                        "Élong.": "?", "Rate \"/m": "?", "Unc. \"": "?",
-                        "Score NEO": 0, "Score": score,
-                        "Statut": score_label(score),
-                        "Taille": classify_size(h_val), "MàJ": "Fallback .txt",
-                    })
-                except (ValueError, IndexError):
-                    continue
+                    tdes = parts[0]; vmag = float(parts[5]) if len(parts) > 5 else 99.0
+                    h_val = float(parts[-2]); n_arc = float(parts[-3]); n_obs = int(float(parts[-4]))
+                    score = compute_score(h_val, n_obs, n_arc, 99, 0)
+                    vs, vl = vespera_score(vmag)
+                    rows.append({"Nom": tdes, "H": round(h_val,1), "Vmag": round(vmag,1),
+                                 "NObs": n_obs, "Arc (j)": round(n_arc,2),
+                                 "MOID (UA)": ">0.1", "CA min (LD)": "?", "Vit. ∞": "?",
+                                 "R.A.": "?", "Déc.": "?", "Élong.": "?", "Rate \"/m": "?",
+                                 "Unc. \"": "?", "Score NEO": 0, "Score": score,
+                                 "Statut": score_label(score), "Taille": classify_size(h_val),
+                                 "Vespera": vs, "Obs. Vespera": vl, "MàJ": "Fallback .txt"})
+                except: continue
             if rows:
                 df = pd.DataFrame(rows)
                 df = df[~df['Nom'].isin(st.session_state.archived)]
-                # On ne met PAS en cache le fallback pour reessayer Scout au prochain refresh
-        except Exception:
+        except:
             df = st.session_state.scout_cache.copy()
-
     return df
 
 
-def fetch_nasa_cad(radius: int, days: int) -> tuple:
+# ═══════════════════════════════════════════════════════════════════════════════
+# FETCH NASA CAD
+# ═══════════════════════════════════════════════════════════════════════════════
+def fetch_nasa_cad(radius, days):
     now = datetime.now()
     td = (now - st.session_state.last_nasa_req).total_seconds()
     if td > 60:
@@ -692,184 +853,103 @@ def fetch_nasa_cad(radius: int, days: int) -> tuple:
             if "data" in res:
                 st.session_state.nasa_cache = pd.DataFrame(res["data"], columns=res["fields"])
                 st.session_state.last_nasa_req = now
-        except Exception:
-            pass
+        except: pass
     return st.session_state.nasa_cache.copy(), max(0, int(60 - td))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FETCH COMÈTES
+# ═══════════════════════════════════════════════════════════════════════════════
 def fetch_comets() -> pd.DataFrame:
-    """
-    Parse CometEls.txt (format MPC officiel, espace-séparé) :
-    Col 0      : désignation packée (ex: PJ96R020)
-    Col 1      : année périhélie
-    Col 2      : mois périhélie
-    Col 3      : jour.dddd périhélie
-    Col 4      : q (distance périhélie, UA)
-    Col 5      : e (excentricité)
-    Col 6      : ω (argument périhélie, °)
-    Col 7      : Ω (longitude nœud ascendant, °)
-    Col 8      : i (inclinaison, °)
-    Col 9      : epoch (YYYYMMDD)
-    Col 10     : g (magnitude absolue)
-    Col 11     : k (pente magnitude)
-    Col 12+    : nom complet (P/..., C/..., etc.)
-    Source : http://www.minorplanetcenter.net/iau/MPCORB/CometEls.txt
-    """
     now = datetime.now()
     td = (now - st.session_state.last_comet_req).total_seconds()
     if td < 10800 and not st.session_state.comet_cache.empty:
         return st.session_state.comet_cache.copy()
-
-    # Utiliser CometEls.txt plutôt que Soft00Cmt.txt — même format, plus fiable
-    COMET_URL = "http://www.minorplanetcenter.net/iau/MPCORB/CometEls.txt"
     rows = []
     try:
         rc = requests.get(COMET_URL, timeout=8)
         rc.raise_for_status()
         for line in rc.text.split('\n'):
             line = line.strip()
-            if not line or line.startswith('#'):
-                continue
+            if not line or line.startswith('#'): continue
             parts = line.split()
-            if len(parts) < 12:
-                continue
+            if len(parts) < 12: continue
             try:
-                yr   = int(parts[1])
-                mo   = int(parts[2])
-                dy   = float(parts[3])
-                q    = float(parts[4])
-                e    = float(parts[5])
-                w    = float(parts[6])
-                node = float(parts[7])
-                i    = float(parts[8])
-                g    = float(parts[10])
-                k    = float(parts[11])
-                nom  = " ".join(parts[12:]).strip() if len(parts) > 12 else parts[0]
-
+                yr = int(parts[1]); mo = int(parts[2]); dy = float(parts[3])
+                q  = float(parts[4]); e  = float(parts[5])
+                w  = float(parts[6]); node = float(parts[7]); i = float(parts[8])
+                g  = float(parts[10]); k = float(parts[11])
+                nom = " ".join(parts[12:]).strip() if len(parts) > 12 else parts[0]
                 if q <= 0 or q > 50 or e < 0 or g > 30: continue
-
-                # ── Période orbitale (3ème loi de Kepler) ──
-                # Pour e < 1 (elliptique) : a = q/(1-e), T = a^1.5 années
-                # Pour e >= 1 (hyperbolique/parabolique) : pas de période
                 if e < 1.0:
-                    a = q / (1.0 - e)
-                    periode_ans = round(a ** 1.5, 2)
-                    periode_str = f"{periode_ans} ans"
-                    periode_jours = periode_ans * 365.25
+                    a = q / (1.0 - e); periode_ans = round(a ** 1.5, 2)
+                    periode_str = f"{periode_ans} ans"; periode_jours = periode_ans * 365.25
                 else:
-                    periode_ans   = None
-                    periode_str   = "Non périodique"
-                    periode_jours = None
-
-                # ── Dernier et prochain périhélie ──
+                    periode_ans = None; periode_str = "Non périodique"; periode_jours = None
                 try:
                     t_last = datetime(yr, mo, max(1, int(dy)))
                     days_since = (now - t_last).days
-
                     if days_since >= 0:
-                        # Le passage enregistré est passé
                         dernier_str = f"{t_last.strftime('%Y-%m-%d')} (il y a {days_since}j)"
                         if periode_jours:
-                            # Calculer le prochain passage en ajoutant N périodes
                             n_periods = math.ceil(days_since / periode_jours)
                             t_next = t_last + timedelta(days=n_periods * periode_jours)
                             days_to_next = (t_next - now).days
                             prochain_str = f"{t_next.strftime('%Y-%m-%d')} (dans {days_to_next}j)"
-                        else:
-                            prochain_str = "N/A (non périodique)"
+                        else: prochain_str = "N/A"
                     else:
-                        # Le passage enregistré est dans le futur = c'est déjà le prochain
                         days_to = abs(days_since)
                         prochain_str = f"{t_last.strftime('%Y-%m-%d')} (dans {days_to}j)"
                         if periode_jours:
                             t_prev = t_last - timedelta(days=periode_jours)
                             days_prev = (now - t_prev).days
                             dernier_str = f"{t_prev.strftime('%Y-%m-%d')} (il y a {days_prev}j)"
-                        else:
-                            dernier_str = "N/A"
-                except Exception:
-                    dernier_str  = f"{yr}-{mo:02d}-{int(dy):02d}"
-                    prochain_str = "?"
-
-                # ── Magnitude au prochain périhélie (formule cométaire standard corrigée) ──
-                # m = g + 5·log10(Δ) + k·log10(r)
-                # Au périhélie : r = q, Δ ≈ |q - 1| si q > 1, sinon Δ ≈ 1 - q
-                # Eviter log(0) : Δ minimum = 0.1 UA
-                r_peri  = max(0.01, q)
-                delta_p = max(0.1, abs(q - 1.0))
+                        else: dernier_str = "N/A"
+                except:
+                    dernier_str = f"{yr}-{mo:02d}-{int(dy):02d}"; prochain_str = "?"
+                r_peri = max(0.01, q); delta_p = max(0.1, abs(q - 1.0))
                 mag_peri = round(g + 5*math.log10(delta_p) + k*math.log10(r_peri), 1)
-                # Clamp : magnitude physiquement impossible en dehors de -10..25
                 mag_peri = max(-10.0, min(25.0, mag_peri))
                 v_sc, v_lb = vespera_score(mag_peri)
-
                 rows.append({
-                    "Nom":           nom[:60],
-                    "Dernier peri.": dernier_str,
-                    "Prochain peri.":prochain_str,
-                    "Période":       periode_str,
-                    "q (UA)":        round(q, 4),
-                    "e":             round(e, 5),
-                    "i (°)":         round(i, 2),
-                    "g":             round(g, 1),
-                    "k":             round(k, 1),
-                    "Mag.@peri":     mag_peri,
-                    "Mag.actuelle":  "?",
-                    "Élong. (°)":    "?",
-                    "Observable ?":  "?",
-                    "Vespera@peri":  v_sc,
-                    "Obs.@peri":     v_lb,
-                    "Vespera act.":  "?",
-                    "Obs. actuelle": "?",
+                    "Nom": nom[:60], "Dernier peri.": dernier_str, "Prochain peri.": prochain_str,
+                    "Période": periode_str, "q (UA)": round(q, 4), "e": round(e, 5),
+                    "i (°)": round(i, 2), "g": round(g, 1), "k": round(k, 1),
+                    "Mag.@peri": mag_peri, "Mag.actuelle": "?", "Élong. (°)": "?",
+                    "Observable ?": "?", "Vespera@peri": v_sc, "Obs.@peri": v_lb,
+                    "Vespera act.": "?", "Obs. actuelle": "?",
                 })
-            except (ValueError, IndexError):
-                continue
-    except Exception:
+            except: continue
+    except:
         return st.session_state.comet_cache.copy()
-
-    if not rows:
-        return st.session_state.comet_cache.copy()
-
+    if not rows: return st.session_state.comet_cache.copy()
     df = pd.DataFrame(rows)
 
-    # ── Enrichissement Horizons (parallèle, comètes brillantes seulement) ──
-    HORIZONS    = "https://ssd.jpl.nasa.gov/api/horizons.api"
-    today_str   = now.strftime("%Y-%m-%d")
-    tomorrow_str= (now + timedelta(days=1)).strftime("%Y-%m-%d")
-
+    # Enrichissement Horizons (comètes brillantes)
+    today_str = now.strftime("%Y-%m-%d"); tomorrow_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
     def _horizons_query(idx_nom):
         idx, nom_comet = idx_nom
-        # Format attendu Horizons : "C/2024 G3" ou "P/2023 A1" etc.
         m_des = re.match(r'^([CP]/\d{4}\s+\w+)', nom_comet)
-        if not m_des:
-            return idx, None
+        if not m_des: return idx, None
         des_short = m_des.group(1).strip()
         try:
-            params_h = {
-                "format":     "json",
-                "COMMAND":    f"'{des_short}'",
-                "EPHEM_TYPE": "OBSERVER",
-                "CENTER":     "500@399",
-                "START_TIME": today_str,
-                "STOP_TIME":  tomorrow_str,
-                "STEP_SIZE":  "1d",
-                "QUANTITIES": "9,23",  # V magnitude + elongation
-            }
-            rh = requests.get(HORIZONS, params=params_h, timeout=6)
+            params_h = {"format": "json", "COMMAND": f"'{des_short}'", "EPHEM_TYPE": "OBSERVER",
+                        "CENTER": "500@399", "START_TIME": today_str, "STOP_TIME": tomorrow_str,
+                        "STEP_SIZE": "1d", "QUANTITIES": "9,23"}
+            rh = requests.get(HORIZONS_API, params=params_h, timeout=6)
             txt = rh.text
             if "$$SOE" in txt and "$$EOE" in txt:
-                block  = txt[txt.index("$$SOE")+5 : txt.index("$$EOE")].strip()
+                block = txt[txt.index("$$SOE")+5 : txt.index("$$EOE")].strip()
                 line_h = [l.strip() for l in block.split('\n') if l.strip()]
                 if line_h:
                     p = line_h[0].split()
                     if len(p) >= 4:
-                        v_act  = float(p[-2])
-                        elong  = float(p[-1])
+                        v_act = float(p[-2]); elong = float(p[-1])
                         vs, vl = vespera_score(v_act)
-                        obs    = "✅ Oui" if elong > 20 and v_act < 17.5 else \
-                                 "🟡 Difficile" if elong > 15 and v_act < 19 else "❌ Non"
+                        obs = ("✅ Oui" if elong > 20 and v_act < 17.5 else
+                               "🟡 Difficile" if elong > 15 and v_act < 19 else "❌ Non")
                         return idx, {"v": round(v_act,1), "e": round(elong,1), "obs": obs, "vs": vs, "vl": vl}
-        except Exception:
-            pass
+        except: pass
         return idx, None
 
     bright = [(i, r["Nom"]) for i, r in df.iterrows()
@@ -882,55 +962,44 @@ def fetch_comets() -> pd.DataFrame:
                     try:
                         idx, data = fut.result()
                         if data:
-                            df.at[idx, "Mag.actuelle"]   = data["v"]
-                            df.at[idx, "Élong. (°)"]     = data["e"]
-                            df.at[idx, "Observable ?"]   = data["obs"]
-                            df.at[idx, "Vespera act."]   = data["vs"]
-                            df.at[idx, "Obs. actuelle"]  = data["vl"]
-                    except Exception:
-                        continue
-        except FuturesTimeout:
-            pass
-
-    st.session_state.comet_cache    = df
-    st.session_state.last_comet_req = now
-    return df
+                            df.at[idx, "Mag.actuelle"]  = data["v"]
+                            df.at[idx, "Élong. (°)"]    = data["e"]
+                            df.at[idx, "Observable ?"]  = data["obs"]
+                            df.at[idx, "Vespera act."]  = data["vs"]
+                            df.at[idx, "Obs. actuelle"] = data["vl"]
+                    except: continue
+        except FuturesTimeout: pass
 
     st.session_state.comet_cache = df
     st.session_state.last_comet_req = now
     return df
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PARSE SBDB
 # ═══════════════════════════════════════════════════════════════════════════════
-def parse_sbdb(res: dict) -> dict:
-    obj  = res.get("object", {})
-    orb  = res.get("orbit", {})
-    phy  = res.get("phys_par", [])
-    ca   = res.get("close_approach_data", [])
+def parse_sbdb(res):
+    obj = res.get("object", {}); orb = res.get("orbit", {})
+    phy = res.get("phys_par", []); ca = res.get("close_approach_data", [])
     elems = orb.get("elements", {})
-    if isinstance(elems, list):
-        elems = {e["name"]: e.get("value","?") for e in elems}
-    if isinstance(phy, list):
-        phy_d = {p["name"]: p.get("value") for p in phy if isinstance(p,dict) and "name" in p}
-    else:
-        phy_d = {k: (v.get("value") if isinstance(v,dict) else v) for k,v in phy.items()}
+    if isinstance(elems, list): elems = {e["name"]: e.get("value","?") for e in elems}
+    if isinstance(phy, list): phy_d = {p["name"]: p.get("value") for p in phy if isinstance(p,dict) and "name" in p}
+    else: phy_d = {k: (v.get("value") if isinstance(v,dict) else v) for k,v in phy.items()}
     def _p(k): return phy_d.get(k) or "N/A"
-    return {
-        "fullname":    obj.get("fullname","?"), "spkid": obj.get("spkid","?"),
-        "neo":         "✅" if obj.get("neo") else "❌",
-        "pha":         "⚠️ OUI" if obj.get("pha") else "non",
-        "orbit_class": obj.get("orbit_class",{}).get("name","?"),
-        "condition_code": orb.get("condition_code","?"),
-        "first_obs":   orb.get("first_obs","?"), "soln_date": orb.get("soln_date","?"),
-        "e": elems.get("e","?"), "a": elems.get("a","?"), "q": elems.get("q","?"),
-        "i": elems.get("i","?"), "per_y": elems.get("per_y", orb.get("per_y","?")),
-        "moid": orb.get("moid","?"),
-        "H": _p("H"), "G": _p("G"), "albedo": _p("albedo"),
-        "diameter": _p("diameter"), "density": _p("density"),
-        "rot_per": _p("rot_per"), "spec_T": _p("spec_T"),
-        "ps_cum": _p("ps_cum"), "ts_max": _p("ts_max"), "ca": ca,
-    }
+    return {"fullname": obj.get("fullname","?"), "spkid": obj.get("spkid","?"),
+            "neo": "✅" if obj.get("neo") else "❌",
+            "pha": "⚠️ OUI" if obj.get("pha") else "non",
+            "orbit_class": obj.get("orbit_class",{}).get("name","?"),
+            "condition_code": orb.get("condition_code","?"),
+            "first_obs": orb.get("first_obs","?"), "soln_date": orb.get("soln_date","?"),
+            "e": elems.get("e","?"), "a": elems.get("a","?"), "q": elems.get("q","?"),
+            "i": elems.get("i","?"), "per_y": elems.get("per_y", orb.get("per_y","?")),
+            "moid": orb.get("moid","?"),
+            "H": _p("H"), "G": _p("G"), "albedo": _p("albedo"),
+            "diameter": _p("diameter"), "density": _p("density"),
+            "rot_per": _p("rot_per"), "spec_T": _p("spec_T"),
+            "ps_cum": _p("ps_cum"), "ts_max": _p("ts_max"), "ca": ca}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -940,31 +1009,35 @@ with st.sidebar:
         "<div style='text-align:center;padding:14px 0 6px'>"
         "<span style='font-family:var(--mono);font-size:1.4em;color:var(--accent);"
         "text-shadow:0 0 12px rgba(0,212,255,.6)'>DEEP SPACE</span><br>"
-        "<span style='font-family:var(--ui);font-size:.68em;letter-spacing:4px;color:var(--muted)'>RADAR SYSTEM V27</span>"
+        "<span style='font-family:var(--ui);font-size:.68em;letter-spacing:4px;color:var(--muted)'>RADAR SYSTEM V28</span>"
         "</div>", unsafe_allow_html=True)
+
     st.markdown('<div class="sidebar-sec">⏱ ACTUALISATION</div>', unsafe_allow_html=True)
     refresh_rate = st.slider("Rafraîchissement (s)", 30, 300, 60)
+
     st.markdown('<div class="sidebar-sec">🔭 CHAMP NASA CAD</div>', unsafe_allow_html=True)
     radius_ld    = st.slider("Rayon (Distance Lunaire)", 1, 2500, 500)
     horizon_days = st.slider("Horizon temporel (jours)", 1, 90, 30)
-    st.markdown('<div class="sidebar-sec">🎛 FILTRES VESPERA (NASA + Comètes seulement)</div>', unsafe_allow_html=True)
-    vespera_mode = st.toggle("Filtre Vespera II (magnitude)", value=False)
+
+    st.markdown('<div class="sidebar-sec">🌟 FILTRES SUPERNOVÆ</div>', unsafe_allow_html=True)
+    sn_mag_limit  = st.slider("Magnitude max SN", 10.0, 22.0, 19.0, 0.5)
+    sn_vespera_only = st.toggle("Seulement observables Vespera", value=False)
+    sn_show_galactic_alert = st.toggle("Alerte galactique prioritaire", value=True)
+
+    st.markdown('<div class="sidebar-sec">🎛 FILTRES VESPERA</div>', unsafe_allow_html=True)
+    vespera_mode = st.toggle("Filtre Vespera II (NASA+Comètes)", value=False)
     mag_limit    = st.slider("Magnitude H max", 5.0, 30.0, 19.0)
+
     st.markdown(
         f"<div style='font-size:.72em;color:var(--muted);font-family:var(--body);line-height:1.6'>"
-        f"⚠️ Ce filtre ne s'applique PAS aux anomalies NEOCP<br>"
-        f"Sources : NASA Scout · JPL CAD · MPC Comètes<br>"
+        f"Sources : NASA Scout · JPL CAD · MPC · Rochester Astronomy<br>"
         f"Session : {st.session_state.last_refresh.strftime('%H:%M:%S')}</div>",
         unsafe_allow_html=True)
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHARGEMENT DONNÉES
-# Stratégie : chargement en deux passes pour éviter la page noire
-#   Passe 1 (rapide, bloquante)  : Scout + NASA CAD → affichage immédiat
-#   Passe 2 (différée, légère)   : Comètes → chargées uniquement si tab actif
 # ═══════════════════════════════════════════════════════════════════════════════
-
-# Passe 1 : sources principales, toujours chargées
 status_ph = st.empty()
 status_ph.info("⏳ Connexion Scout NASA…")
 df_scout = fetch_scout()
@@ -972,37 +1045,44 @@ df_scout = fetch_scout()
 status_ph.info("⏳ Connexion NASA JPL CAD…")
 df_nasa, timer_nasa = fetch_nasa_cad(radius_ld, horizon_days)
 
-status_ph.empty()  # Effacer le message — la page s'affiche maintenant
+status_ph.info("⏳ Chargement supernovæ (Rochester)…")
+df_sn_all = fetch_supernovae()
 
-# Comètes : chargées depuis le cache si dispo, sinon différé (pas bloquant)
+status_ph.empty()
+
 df_comets = st.session_state.comet_cache.copy() if not st.session_state.comet_cache.empty else pd.DataFrame()
 
-# Filtres Vespera UNIQUEMENT sur NASA et comètes — JAMAIS sur Scout/anomalies
+# Filtres Vespera sur NASA et comètes
 if vespera_mode:
     if not df_nasa.empty and 'h' in df_nasa.columns:
         df_nasa = df_nasa[pd.to_numeric(df_nasa['h'], errors='coerce') <= mag_limit].copy()
-    if not df_comets.empty and 'Mag. est.' in df_comets.columns:
-        df_comets = df_comets[pd.to_numeric(df_comets['Mag. est.'], errors='coerce') <= mag_limit].copy()
+    if not df_comets.empty and 'Mag.@peri' in df_comets.columns:
+        df_comets = df_comets[pd.to_numeric(df_comets['Mag.@peri'], errors='coerce') <= mag_limit].copy()
 
-# Séparer : anomalies (vrais candidats) vs déjà catalogués (bien connus, score NEO faible)
+# Filtres supernovæ
+df_sn = df_sn_all.copy()
+if not df_sn.empty:
+    df_sn = df_sn[pd.to_numeric(df_sn['Mag'], errors='coerce') <= sn_mag_limit]
+    if sn_vespera_only:
+        df_sn = df_sn[df_sn['Vespera'] >= 45]
+
+# Scout split anomalies / catalogués
 if not df_scout.empty and '_catalogued' in df_scout.columns:
     df_catalogued_scout = df_scout[df_scout['_catalogued']].copy()
     df_scout_anom       = df_scout[~df_scout['_catalogued']].copy()
-    # Retirer la colonne interne des deux
     df_catalogued_scout.drop(columns=['_catalogued'], inplace=True, errors='ignore')
     df_scout_anom.drop(columns=['_catalogued'], inplace=True, errors='ignore')
 else:
     df_catalogued_scout = pd.DataFrame()
-    df_scout_anom       = df_scout.copy()
+    df_scout_anom = df_scout.copy()
     if '_catalogued' in df_scout_anom.columns:
         df_scout_anom.drop(columns=['_catalogued'], inplace=True)
 
-# Historique — synchronisé avec les objets actifs (anomalies uniquement)
+# Historique Scout
 if not df_scout_anom.empty:
     for r in df_scout_anom.itertuples():
         nm = r.Nom
-        if nm not in st.session_state.obj_history:
-            st.session_state.obj_history[nm] = []
+        if nm not in st.session_state.obj_history: st.session_state.obj_history[nm] = []
         st.session_state.obj_history[nm].append({
             "T": datetime.now().strftime("%H:%M"), "S": r.Score,
             "H": r.H, "NObs": r.NObs, "Arc": getattr(r, "Arc (j)", 0),
@@ -1011,20 +1091,19 @@ if not df_scout_anom.empty:
         if len(st.session_state.obj_history[nm]) > 30:
             st.session_state.obj_history[nm].pop(0)
 
-# Purger historique : ne garder que les objets actifs + reconnus (pas archivés)
+# Purge historique
 active_noms = set(df_scout_anom['Nom'].tolist()) if not df_scout_anom.empty else set()
-reconnus    = set(st.session_state.recognized_objects.keys())
+reconnus = set(st.session_state.recognized_objects.keys())
 keys_to_keep = (active_noms | reconnus) - st.session_state.archived
 for k in list(st.session_state.obj_history.keys()):
-    if k not in keys_to_keep:
-        del st.session_state.obj_history[k]
+    if k not in keys_to_keep: del st.session_state.obj_history[k]
 
-# Détection transitions (objets disparus de Scout)
+# Transitions + alertes
 prev_noms = st.session_state.prev_noms
 transitions = detect_transitions(prev_noms, active_noms, df_nasa)
 st.session_state.prev_noms = active_noms
-
 monitor_and_alert(df_scout_anom, df_nasa, transitions)
+alert_supernovae(df_sn)
 _process_discord_queue()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1035,12 +1114,12 @@ with c1:
     st.markdown(
         "<div style='padding:16px 0 6px;border-bottom:1px solid var(--border);margin-bottom:18px'>"
         "<div class='radar-logo'>🛰️ DEEP SPACE RADAR</div>"
-        "<div class='radar-sub'>Surveillance NEOCP · Scout NASA · V27.0</div></div>",
+        "<div class='radar-sub'>Surveillance NEOCP · Scout NASA · Supernovæ · V28.0</div></div>",
         unsafe_allow_html=True)
 with c2:
     st.markdown(
         f"<div style='display:flex;justify-content:flex-end;align-items:center;height:100%;padding-top:24px'>"
-        f"<div class='sync-pill'><div class='sync-dot'></div>SCOUT+NASA {timer_nasa}s</div></div>",
+        f"<div class='sync-pill'><div class='sync-dot'></div>LIVE {timer_nasa}s</div></div>",
         unsafe_allow_html=True)
 
 n_anom = len(df_scout_anom)
@@ -1048,6 +1127,26 @@ n_crit = len(df_scout_anom[df_scout_anom['Score'] >= 80]) if not df_scout_anom.e
 n_nasa = len(df_nasa) if not df_nasa.empty else 0
 n_com  = len(df_comets) if not df_comets.empty else 0
 n_rec  = len(st.session_state.recognized_objects)
+n_sn   = len(df_sn) if not df_sn.empty else 0
+n_sn_vesp = len(df_sn[df_sn['Vespera'] >= 45]) if not df_sn.empty else 0
+n_gal  = len(df_sn[df_sn['Galactique ?'].str.contains('OUI', na=False)]) if not df_sn.empty else 0
+
+# Alerte galactique en haut de page
+if n_gal > 0 and sn_show_galactic_alert:
+    gal_row = df_sn[df_sn['Galactique ?'].str.contains('OUI', na=False)].iloc[0]
+    st.markdown(f"""
+<div class="galactic-alert">
+  <div class="galactic-alert-title">🚨 SUPERNOVA GALACTIQUE DÉTECTÉE 🚨</div>
+  <div style="font-family:var(--mono);color:var(--accent3);font-size:1.1em">
+    {gal_row['Nom']} · Mag {gal_row['Mag']} · b = {gal_row.get('Lat. gal. (°)','?')}°
+  </div>
+  <div style="color:var(--text);margin-top:8px;font-size:.9em">
+    Hôte : {gal_row.get('Galaxie hôte','?')} · Type : {gal_row.get('Type emoji','')} {gal_row.get('Type','?')}
+  </div>
+  <div style="color:var(--muted);font-size:.8em;margin-top:6px">
+    ⚠️ Événement exceptionnel — vérifier immédiatement sur TNS et ATel
+  </div>
+</div>""", unsafe_allow_html=True)
 
 st.markdown(f"""
 <div class="metric-grid">
@@ -1055,20 +1154,34 @@ st.markdown(f"""
   <div class="metric-card {'w' if n_crit else 'g'}"><div class="metric-val">{n_crit}</div><div class="metric-label">Critiques ≥80</div></div>
   <div class="metric-card"><div class="metric-val">{n_nasa}</div><div class="metric-label">Objets NASA proches</div></div>
   <div class="metric-card g"><div class="metric-val">{n_com}</div><div class="metric-label">Comètes actives</div></div>
+  <div class="metric-card p"><div class="metric-val">{n_sn}</div><div class="metric-label">Supernovæ ({n_sn_vesp} Vespera)</div></div>
   <div class="metric-card c"><div class="metric-val">{n_rec}</div><div class="metric-label">Désignés (session)</div></div>
+  {'<div class="metric-card pk"><div class="metric-val">🌌 ' + str(n_gal) + '</div><div class="metric-label">SN Galactiques !!!</div></div>' if n_gal > 0 else ''}
 </div>
 """, unsafe_allow_html=True)
+
+# Fun fact rotatif
+ff = FUN_FACTS[st.session_state.fun_fact_idx % len(FUN_FACTS)]
+st.markdown(f"""
+<div class="fun-fact">
+  <div class="fun-fact-title">💡 LE SAVIEZ-VOUS ? — {ff[0]}</div>
+  <div class="fun-fact-text">{ff[1]}</div>
+</div>""", unsafe_allow_html=True)
+st.session_state.fun_fact_idx += 1
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ONGLETS
 # ═══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🔭  SCOUT NEOCP",
-    "🎯  DÉSIGNÉS NASA",
-    "🚀  CATALOGUE NASA",
+    "🌟  SUPERNOVÆ",
+    "🎯  DÉSIGNÉS",
+    "🚀  NASA CAD",
     "🌠  COMÈTES",
-    "📘  LEXIQUE"
+    "📘  LEXIQUE",
 ])
+
 
 # ── TAB 1 : SCOUT ─────────────────────────────────────────────────────────────
 with tab1:
@@ -1079,7 +1192,7 @@ with tab1:
         disp = df_scout_anom.copy()
         disp['Tr.']  = disp.apply(lambda r: get_trend(r['Nom'], r['Score']), axis=1)
         disp['Rang'] = range(1, len(disp) + 1)
-        cols = ["Rang","Nom","Type","H","Vmag","NObs","Arc (j)","MOID (UA)",
+        cols = ["Rang","Nom","Type","H","Vmag","Obs. Vespera","NObs","Arc (j)","MOID (UA)",
                 "CA min (LD)","Score NEO","Score","Statut","Taille","Tr."]
         cols = [c for c in cols if c in disp.columns]
         st.dataframe(
@@ -1088,55 +1201,208 @@ with tab1:
         st.caption(
             "H = mag absolue · Vmag = mag visuelle · NObs = observations · Arc = arc orbital (j) · "
             "MOID = dist min Terre-objet (UA) · CA min = dist min approche (LD) · "
-            "Score NEO = probabilité d'être un NEO selon MPC (≠ dangerosité)")
+            "Score NEO = probabilité NEO selon MPC")
     else:
         st.markdown('<div class="empty">// AUCUN CANDIDAT ACTIF — API SCOUT EN ATTENTE //</div>', unsafe_allow_html=True)
 
-    # Objets catalogués (bien connus, faible intérêt)
     if not df_catalogued_scout.empty:
-        with st.expander(f"📋 Objets bien connus / déjà catalogués ({len(df_catalogued_scout)}) — faible priorité"):
-            st.caption("Score NEO faible + beaucoup d'observations + arc long → orbite bien connue, peu d'intérêt pour suivi")
-            cols_cat = [c for c in ["Nom","Type","H","Vmag","NObs","Arc (j)","Score NEO","Score"] if c in df_catalogued_scout.columns]
+        with st.expander(f"📋 Objets bien connus / déjà catalogués ({len(df_catalogued_scout)})"):
+            cols_cat = [c for c in ["Nom","Type","H","Vmag","NObs","Arc (j)","Score NEO","Score","Obs. Vespera"] if c in df_catalogued_scout.columns]
             st.dataframe(df_catalogued_scout[cols_cat], use_container_width=True, hide_index=True)
 
-    # Archivage manuel
     st.markdown("---")
     st.markdown('<div class="sec" style="color:var(--accent3)">🗃️ Archivage Manuel</div>', unsafe_allow_html=True)
-    st.caption("Retire un objet de tous les tableaux ET de l'historique une fois étudié.")
     all_scout_noms = (df_scout_anom['Nom'].tolist() if not df_scout_anom.empty else []) + \
                      (df_catalogued_scout['Nom'].tolist() if not df_catalogued_scout.empty else [])
     col_sel, col_btn = st.columns([3, 1])
     with col_sel:
-        to_archive = st.selectbox(
-            "Objet à archiver :", ["— sélectionner —"] + sorted(all_scout_noms),
-            key="archive_sel")
+        to_archive = st.selectbox("Objet à archiver :", ["— sélectionner —"] + sorted(all_scout_noms), key="archive_sel")
     with col_btn:
-        if st.button("🗃️ Archiver", use_container_width=True, key="archive_btn"):
+        if st.button("🗃️ Archiver", use_container_width=True):
             if to_archive != "— sélectionner —":
                 st.session_state.archived.add(to_archive)
                 if to_archive in st.session_state.obj_history:
                     del st.session_state.obj_history[to_archive]
                 st.rerun()
-
     if st.session_state.archived:
-        with st.expander(f"📦 Objets archivés ({len(st.session_state.archived)})"):
+        with st.expander(f"📦 Archivés ({len(st.session_state.archived)})"):
             for a in sorted(st.session_state.archived):
                 col_a, col_b = st.columns([3, 1])
                 with col_a: st.text(a)
                 with col_b:
-                    if st.button("↩️ Restaurer", key=f"restore_{a}"):
-                        st.session_state.archived.discard(a)
-                        st.rerun()
+                    if st.button("↩️", key=f"restore_{a}"):
+                        st.session_state.archived.discard(a); st.rerun()
 
-# ── TAB 2 : DÉSIGNÉS ──────────────────────────────────────────────────────────
+
+# ── TAB 2 : SUPERNOVÆ ─────────────────────────────────────────────────────────
 with tab2:
-    st.markdown('<div class="sec">Objets Récemment Désignés · Transition NEOCP → NASA</div>', unsafe_allow_html=True)
-    st.caption(
-        "Ces objets étaient sur le NEOCP et ont reçu une désignation officielle. "
-        "La correspondance est établie via : (1) query SBDB directe par tdes, "
-        "(2) similarité H dans le CAD, (3) contexte temporel."
-    )
+    st.markdown('<div class="sec sn">Supernovæ Récentes · Rochester Astronomy + TNS</div>', unsafe_allow_html=True)
 
+    col_info1, col_info2, col_info3 = st.columns(3)
+    with col_info1:
+        st.markdown(f"""
+<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center">
+  <div style="font-family:var(--mono);font-size:1.6em;color:var(--purple)">{n_sn}</div>
+  <div style="font-size:.72em;color:var(--muted);text-transform:uppercase;letter-spacing:2px">Supernovæ trouvées</div>
+</div>""", unsafe_allow_html=True)
+    with col_info2:
+        st.markdown(f"""
+<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center">
+  <div style="font-family:var(--mono);font-size:1.6em;color:var(--green)">{n_sn_vesp}</div>
+  <div style="font-size:.72em;color:var(--muted);text-transform:uppercase;letter-spacing:2px">Observables Vespera II</div>
+</div>""", unsafe_allow_html=True)
+    with col_info3:
+        st.markdown(f"""
+<div style="background:var(--surface);border:1px solid {'var(--accent2)' if n_gal > 0 else 'var(--border)'};
+  border-radius:8px;padding:12px;text-align:center">
+  <div style="font-family:var(--mono);font-size:1.6em;color:{'#ff4b4b' if n_gal > 0 else 'var(--muted)'}">
+    {'🌌 ' + str(n_gal) if n_gal > 0 else '0'}
+  </div>
+  <div style="font-size:.72em;color:var(--muted);text-transform:uppercase;letter-spacing:2px">Galactiques !!!</div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    if df_sn.empty:
+        if df_sn_all.empty:
+            st.markdown('<div class="empty">// DONNÉES SUPERNOVÆ NON DISPONIBLES — Cliquer Rafraîchir //</div>', unsafe_allow_html=True)
+            if st.button("🔄 Charger les supernovæ"):
+                st.session_state.last_sn_req = datetime.now() - timedelta(hours=3)
+                st.rerun()
+        else:
+            st.info(f"Aucune SN dans les critères actuels (mag ≤ {sn_mag_limit}). {len(df_sn_all)} SN disponibles sans filtre.")
+    else:
+        # Affichage en cartes enrichies
+        st.markdown(f"<div style='font-size:.8em;color:var(--muted);margin-bottom:12px'>"
+                    f"Filtre actif : mag ≤ {sn_mag_limit} · "
+                    f"{'Vespera seulement · ' if sn_vespera_only else ''}"
+                    f"Mise à jour : {st.session_state.last_sn_req.strftime('%H:%M:%S')}</div>",
+                    unsafe_allow_html=True)
+
+        # Tri par magnitude
+        df_sn_sorted = df_sn.sort_values("Mag", ascending=True)
+
+        for _, row in df_sn_sorted.iterrows():
+            nom  = row["Nom"]
+            mag  = row["Mag"]
+            snt  = row.get("Type","?")
+            ti   = sn_type_info(snt)
+            host = row.get("Galaxie hôte","?")
+            vs   = row.get("Vespera", 0)
+            vl   = row.get("Obs. Vespera","?")
+            gal  = "OUI" in str(row.get("Galactique ?",""))
+            lat  = row.get("Lat. gal. (°)","?")
+            ra   = row.get("RA (°)","?")
+            dec  = row.get("DEC (°)","?")
+            lien_tns = row.get("Lien TNS","#")
+
+            card_class = "sn-card galactic" if gal else ("sn-card vespera" if vs >= 45 else ("sn-card marginal" if vs >= 15 else "sn-card outofrange"))
+            name_class = "sn-name galactic-name" if gal else "sn-name"
+
+            # Badge type SN
+            type_color = ti.get("couleur","#747d8c")
+            badge_type = f"<span class='sn-badge' style='color:{type_color};border-color:{type_color}'>{ti['emoji']} {snt}</span>"
+
+            # Badge Vespera
+            if vs >= 90:   badge_v = "<span class='sn-badge' style='color:#00ff88;border-color:#00ff88'>🟢 EXCELLENT</span>"
+            elif vs >= 70: badge_v = "<span class='sn-badge' style='color:#f7b731;border-color:#f7b731'>🟡 BON</span>"
+            elif vs >= 45: badge_v = "<span class='sn-badge' style='color:#ff9f43;border-color:#ff9f43'>🟠 LIMITE</span>"
+            elif vs >= 15: badge_v = "<span class='sn-badge' style='color:#ff4b4b;border-color:#ff4b4b'>🔴 DIFFICILE</span>"
+            else:          badge_v = "<span class='sn-badge' style='color:#5a7090;border-color:#5a7090'>⛔ HORS PORTÉE</span>"
+
+            badge_gal = "<span class='sn-badge' style='color:#ff4b4b;border-color:#ff4b4b;animation:nova-glow 1s infinite'>🌌 GALACTIQUE</span>" if gal else ""
+
+            # Historique magnitude
+            hist_mag = st.session_state.sn_history.get(nom, [])
+            if len(hist_mag) >= 2:
+                delta = hist_mag[-1]["Mag"] - hist_mag[0]["Mag"]
+                trend_sn = f"📈 +{delta:.1f} (fading)" if delta > 0.1 else (f"📉 {delta:.1f} (brightening)" if delta < -0.1 else "➡️ stable")
+            else: trend_sn = "➡️ —"
+
+            st.markdown(f"""
+<div class="{card_class}">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+    <div>
+      <span class="{name_class}">{nom}</span>
+      <span style="color:var(--muted);margin:0 8px;font-size:.8em">dans</span>
+      <span class="sn-host">{host}</span>
+    </div>
+    <div style="font-family:var(--mono);font-size:1.3em;color:{'#ffd700' if gal else 'var(--accent3)'}">
+      ✦ mag {mag}
+    </div>
+  </div>
+  <div>{badge_type}{badge_v}{badge_gal}</div>
+  <div class="sn-grid">
+    <div class="sn-stat"><div class="sn-stat-k">Type</div><div class="sn-stat-v">{ti['emoji']} {snt}</div></div>
+    <div class="sn-stat"><div class="sn-stat-k">Description</div><div class="sn-stat-v" style="font-size:.78em">{ti['desc']}</div></div>
+    <div class="sn-stat"><div class="sn-stat-k">Durée typique</div><div class="sn-stat-v">{ti['duree']}</div></div>
+    <div class="sn-stat"><div class="sn-stat-k">Score Vespera</div><div class="sn-stat-v">{vs}/100</div></div>
+    <div class="sn-stat"><div class="sn-stat-k">RA / DEC</div><div class="sn-stat-v" style="font-size:.78em">{ra}° / {dec}°</div></div>
+    <div class="sn-stat"><div class="sn-stat-k">Lat. galactique</div><div class="sn-stat-v">b = {lat}°</div></div>
+    <div class="sn-stat"><div class="sn-stat-k">Évolution mag.</div><div class="sn-stat-v" style="font-size:.78em">{trend_sn}</div></div>
+    <div class="sn-stat"><div class="sn-stat-k">Galactique ?</div><div class="sn-stat-v">{'🌌 OUI !!!' if gal else 'Non'}</div></div>
+  </div>
+  <div style="margin-top:10px;display:flex;gap:12px;font-size:.78em">
+    <a href="{lien_tns}" target="_blank" style="color:var(--accent);font-family:var(--mono)">→ TNS ↗</a>
+    <a href="https://rochesterastronomy.org/supernova.html" target="_blank" style="color:var(--accent3);font-family:var(--mono)">→ Rochester ↗</a>
+    <a href="https://www.astronomerstelegram.org/?read={nom}" target="_blank" style="color:var(--purple);font-family:var(--mono)">→ ATel ↗</a>
+    <a href="https://theskylive.com/supernova-{nom.lower()}" target="_blank" style="color:var(--green);font-family:var(--mono)">→ TheSkyLive ↗</a>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        # Tableau compact en dessous
+        with st.expander("📊 Vue tableau compact"):
+            cols_sn = [c for c in ["Nom","Type","Mag","Obs. Vespera","Galaxie hôte",
+                                    "RA (°)","DEC (°)","Lat. gal. (°)","Galactique ?"] if c in df_sn_sorted.columns]
+            st.dataframe(df_sn_sorted[cols_sn], use_container_width=True, hide_index=True)
+
+    # Explication types SN
+    st.markdown("---")
+    st.markdown('<div class="sec sn">📚 Guide des Types de Supernovæ</div>', unsafe_allow_html=True)
+    cols_types = st.columns(3)
+    type_list = list(SN_TYPE_INFO.items())
+    for idx, (snt_key, snt_val) in enumerate(type_list):
+        with cols_types[idx % 3]:
+            st.markdown(f"""
+<div style="background:var(--surface2);border:1px solid var(--border);border-left:3px solid {snt_val['couleur']};
+     border-radius:8px;padding:10px 12px;margin-bottom:6px">
+  <div style="font-family:var(--mono);font-size:.9em;color:{snt_val['couleur']}">{snt_val['emoji']} Type {snt_key}</div>
+  <div style="font-size:.78em;color:var(--text);margin-top:4px">{snt_val['desc']}</div>
+  <div style="font-size:.72em;color:var(--muted);margin-top:2px">⏱ {snt_val['duree']}</div>
+</div>""", unsafe_allow_html=True)
+
+    # Sources et ressources
+    st.markdown("---")
+    st.markdown('<div class="sec sn">🔗 Sources & Ressources</div>', unsafe_allow_html=True)
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        st.markdown("""
+**Alertes temps réel :**
+- 🌐 [Rochester Astronomy — Latest Supernovae](https://rochesterastronomy.org/supernova.html)
+- 📡 [Transient Name Server (TNS)](https://www.wis-tns.org)
+- 📰 [The Astronomer's Telegram (ATel)](https://www.astronomerstelegram.org)
+- 🔭 [TheSkyLive — Supernovae](https://theskylive.com/supernovae)
+
+**Détection précoce (neutrinos) :**
+- ⚡ [SNEWS — SuperNova Early Warning System](https://snews2.org)
+""")
+    with col_r2:
+        st.markdown("""
+**Suivi photométrique :**
+- 📈 [AAVSO — American Assoc. Variable Star Observers](https://www.aavso.org)
+- 🔬 [WISeREP — Data repository](https://wiserep.weizmann.ac.il)
+- 🌍 [Open Supernova Catalog](https://sne.space)
+
+**Applications mobiles :**
+- 📱 Sirius (app) — alertes transients
+- 📱 Sky Map / Stellarium — localiser la cible
+- 📱 Telescopius — planification observations
+""")
+
+
+# ── TAB 3 : DÉSIGNÉS ──────────────────────────────────────────────────────────
+with tab3:
+    st.markdown('<div class="sec">Objets Récemment Désignés · Transition NEOCP → NASA</div>', unsafe_allow_html=True)
     if st.session_state.recognized_objects:
         for tdes, info in sorted(st.session_state.recognized_objects.items(),
                                   key=lambda x: x[1].get("date",""), reverse=True):
@@ -1144,24 +1410,18 @@ with tab2:
             meth    = info.get("methode", "?")
             det     = info.get("details", {})
             date    = info.get("date", "?")
-
-            # Couleur selon méthode de détection
             border_color = "var(--green)" if "SBDB direct" in meth else \
                            "var(--accent3)" if "Correspondance H" in meth else "var(--muted)"
-
             det_html = "".join(
-                f"<div class='trans-row'><span class='trans-k'>{k}</span><span>{v}</span></div>"
-                for k, v in det.items()
-            )
-
-            # Lien JPL direct vers la désignation officielle
+                f"<div style='display:flex;gap:12px;font-size:.8em;padding:2px 0'>"
+                f"<span style='color:var(--muted);font-family:var(--mono);min-width:120px'>{k}</span>"
+                f"<span>{v}</span></div>" for k, v in det.items())
             sstr = nom_off.replace(" ", "%20")
             lien = f"https://ssd.jpl.nasa.gov/tools/sbdb_lookup.html#/?sstr={sstr}"
-
             st.markdown(f"""
 <div style="background:var(--surface);border:1px solid var(--border);border-left:4px solid {border_color};
      border-radius:10px;padding:14px 16px;margin-bottom:10px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+  <div style="display:flex;justify-content:space-between;margin-bottom:8px">
     <div>
       <span style="font-family:var(--mono);font-size:1.05em;color:var(--accent3)">{tdes}</span>
       <span style="color:var(--muted);margin:0 10px">→</span>
@@ -1172,50 +1432,42 @@ with tab2:
   <div style="font-size:.78em;color:var(--muted);margin-bottom:8px">🔬 Méthode : {meth}</div>
   {det_html}
   <div style="margin-top:10px">
-    <a href="{lien}" target="_blank"
-       style="color:var(--accent);font-family:var(--mono);font-size:.8em">
-      → Fiche complète NASA JPL ↗
-    </a>
+    <a href="{lien}" target="_blank" style="color:var(--accent);font-family:var(--mono);font-size:.8em">→ Fiche JPL ↗</a>
   </div>
 </div>""", unsafe_allow_html=True)
     else:
-        st.markdown(
-            '<div class="empty">// AUCUN OBJET DÉSIGNÉ CETTE SESSION<br>'
-            'Les désignations apparaissent ici lorsqu\'un candidat Scout reçoit un nom officiel //</div>',
-            unsafe_allow_html=True)
+        st.markdown('<div class="empty">// AUCUN OBJET DÉSIGNÉ CETTE SESSION //</div>', unsafe_allow_html=True)
 
-# ── TAB 3 : NASA CAD + LOOKUP ─────────────────────────────────────────────────
-with tab3:
+
+# ── TAB 4 : NASA CAD ──────────────────────────────────────────────────────────
+with tab4:
     st.markdown('<div class="sec">Objets à Approche Rapprochée · NASA JPL CAD</div>', unsafe_allow_html=True)
     if not df_nasa.empty:
         df_n = df_nasa.copy()
-        df_n['H_n']       = pd.to_numeric(df_n.get('h', pd.Series(dtype=float)), errors='coerce')
+        df_n['H_n'] = pd.to_numeric(df_n.get('h', pd.Series(dtype=float)), errors='coerce')
         df_n['Mag. est.'] = df_n['H_n'].apply(lambda x: round(x+2.5,1) if pd.notna(x) else 99)
-        df_n['Taille']    = df_n['H_n'].apply(lambda x: classify_size(x) if pd.notna(x) else "?")
-        df_n['Vespera II']= df_n['Mag. est.'].apply(lambda m: f"{vespera_score(m)[0]} {vespera_score(m)[1]}")
-        # Type : les désignations commençant par C/ ou P/ sont des comètes
+        df_n['Taille'] = df_n['H_n'].apply(lambda x: classify_size(x) if pd.notna(x) else "?")
+        df_n['Vespera II'] = df_n['Mag. est.'].apply(lambda m: f"{vespera_score(m)[0]} {vespera_score(m)[1]}")
         def _nasa_type(des):
             d = str(des)
             if d.startswith('C/') or d.startswith('P/'): return "🌠 Comète"
-            if d.startswith('A/'): return "☄️ Astéroïde interstellaire"
+            if d.startswith('A/'): return "☄️ Interstellaire"
             return "🪨 Astéroïde NEO"
         df_n['Type'] = df_n.get('des', pd.Series()).apply(_nasa_type)
-        rename = {'des':'Désignation','cd':'Date approche','dist':'Dist (LD)','v_rel':'Vit km/s','h':'H'}
         cols_n = [c for c in ['des','Type','cd','dist','v_rel','H_n','Mag. est.','Taille','Vespera II','diameter'] if c in df_n.columns]
-        df_show = df_n[cols_n].rename(columns={**rename,'H_n':'H','diameter':'Diam. km'})
+        df_show = df_n[cols_n].rename(columns={'des':'Désignation','cd':'Date','dist':'Dist (LD)',
+                                               'v_rel':'Vit km/s','H_n':'H','diameter':'Diam. km'})
         if 'Dist (LD)' in df_show.columns:
             df_show = df_show.sort_values('Dist (LD)')
         st.dataframe(df_show, use_container_width=True, hide_index=True)
-        st.markdown("🔗 [Ouvrir NASA JPL SBDB Lookup](https://ssd.jpl.nasa.gov/tools/sbdb_lookup.html)")
     else:
-        st.markdown('<div class="empty">// CATALOGUE NASA VIDE — SYNC EN ATTENTE //</div>', unsafe_allow_html=True)
+        st.markdown('<div class="empty">// CATALOGUE NASA VIDE //</div>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown('<div class="sec">🔍 Fiche Détaillée · NASA JPL SBDB</div>', unsafe_allow_html=True)
     ci, cb = st.columns([3, 1])
     with ci: lq = st.text_input("Désignation :", label_visibility="collapsed", placeholder="Ex : 2024 YR4 · Apophis · 99942")
     with cb: do_l = st.button("🔍 Rechercher", use_container_width=True)
-
     if do_l and lq.strip():
         with st.spinner("Interrogation NASA JPL SBDB…"):
             try:
@@ -1237,8 +1489,8 @@ with tab3:
   <div class="jpl-f">Albédo <span class="jpl-v">{d['albedo']}</span></div>
   <div class="jpl-f">Diamètre <span class="jpl-v">{d['diameter']} km</span></div>
   <div class="jpl-f">Densité <span class="jpl-v">{d['density']} g/cm³</span></div>
-  <div class="jpl-f">Rot. <span class="jpl-v">{d['rot_per']} h</span></div>
-  <div class="jpl-f">Type spectral <span class="jpl-v">{d['spec_T']}</span></div>
+  <div class="jpl-f">Rotation <span class="jpl-v">{d['rot_per']} h</span></div>
+  <div class="jpl-f">Spec. <span class="jpl-v">{d['spec_T']}</span></div>
   <div class="jpl-f">e <span class="jpl-v">{d['e']}</span></div>
   <div class="jpl-f">a (UA) <span class="jpl-v">{d['a']}</span></div>
   <div class="jpl-f">q (UA) <span class="jpl-v">{d['q']}</span></div>
@@ -1249,166 +1501,129 @@ with tab3:
   <div class="jpl-f">Turin <span class="jpl-v">{d['ts_max']}</span></div>
 </div></div>""", unsafe_allow_html=True)
                     if d['ca']:
-                        st.markdown("<div style='margin-top:10px;font-family:var(--ui);font-size:.82em;"
-                                    "color:var(--accent3);letter-spacing:1px'>PROCHAINES APPROCHES</div>",
-                                    unsafe_allow_html=True)
+                        st.markdown("<div style='margin-top:10px;font-family:var(--ui);font-size:.82em;color:var(--accent3)'>PROCHAINES APPROCHES</div>", unsafe_allow_html=True)
                         ca_df = pd.DataFrame(d['ca'][:8])
                         ca_c = [c for c in ['cd','dist','dist_min','dist_max','v_rel','t_sigma_f'] if c in ca_df.columns]
                         st.dataframe(ca_df[ca_c].rename(columns={'cd':'Date','dist':'LD','dist_min':'Min LD',
                                      'dist_max':'Max LD','v_rel':'Vit km/s','t_sigma_f':'Incert.'}),
                                      use_container_width=True, hide_index=True)
                     se = lq.strip().replace(" ","%20")
-                    st.markdown(f"<a href='https://ssd.jpl.nasa.gov/tools/sbdb_lookup.html#/?sstr={se}' "
-                                f"target='_blank' style='color:var(--accent);font-family:var(--mono);font-size:.8em'>"
-                                f"→ Fiche complète JPL ↗</a>", unsafe_allow_html=True)
-                elif "message" in raw:
-                    st.warning(f"NASA JPL : {raw['message']}")
-                else:
-                    st.warning("Objet non trouvé.")
+                    st.markdown(f"<a href='https://ssd.jpl.nasa.gov/tools/sbdb_lookup.html#/?sstr={se}' target='_blank' "
+                                f"style='color:var(--accent);font-family:var(--mono);font-size:.8em'>→ Fiche complète JPL ↗</a>",
+                                unsafe_allow_html=True)
+                elif "message" in raw: st.warning(f"NASA JPL : {raw['message']}")
+                else: st.warning("Objet non trouvé.")
             except Exception as ex:
-                st.error(f"Erreur JPL SBDB : {ex}")
+                st.error(f"Erreur : {ex}")
 
-# ── TAB 4 : COMÈTES ───────────────────────────────────────────────────────────
-with tab4:
+
+# ── TAB 5 : COMÈTES ───────────────────────────────────────────────────────────
+with tab5:
     st.markdown('<div class="sec">Comètes Actives · MPC + NASA Horizons</div>', unsafe_allow_html=True)
-    st.info(
-        "**Mag.actuelle** = magnitude réelle ce soir via NASA Horizons (comètes g<18 seulement) · "
-        "**Élong.** = angle Soleil–comète vu depuis la Terre (>20° = observable) · "
-        "**Mag.@peri** = proxy magnitude au périhélie ⚠️ approximatif · "
-        "Scores Vespera : 100=trivial · 90=excellent · 70=bon (30min) · 45=limite · 15=difficile · 0=impossible"
-    )
-
+    st.info("**Mag.actuelle** via Horizons (comètes g<18) · **Élong.** >20° = observable · Scores Vespera : 90=excellent · 70=bon · 45=limite · 0=impossible")
     comet_cache_ok = not st.session_state.comet_cache.empty
-
     if not comet_cache_ok:
-        st.warning("⚠️ Données comètes non chargées au démarrage (évite le blocage initial).")
-        if st.button("🌠 Charger les comètes", key="load_comets"):
+        st.warning("Données comètes non chargées (évite le blocage initial).")
+        if st.button("🌠 Charger les comètes"):
             with st.spinner("Chargement MPC + Horizons (~15s)…"):
-                st.session_state.comet_cache = pd.DataFrame()  # forcer rechargement
+                st.session_state.comet_cache = pd.DataFrame()
                 result = fetch_comets()
-                if not result.empty:
-                    st.session_state.comet_cache = result
+                if not result.empty: st.session_state.comet_cache = result
             st.rerun()
     else:
         comet_cache_age = (datetime.now() - st.session_state.last_comet_req).total_seconds()
         if comet_cache_age > 10800:
-            if st.button("🔄 Rafraîchir les comètes", key="refresh_comets"):
-                with st.spinner("Mise à jour MPC + Horizons…"):
+            if st.button("🔄 Rafraîchir les comètes"):
+                with st.spinner("Mise à jour…"):
                     st.session_state.comet_cache = pd.DataFrame()
                     result = fetch_comets()
-                    if not result.empty:
-                        st.session_state.comet_cache = result
+                    if not result.empty: st.session_state.comet_cache = result
                 st.rerun()
-
         df_comets_show = st.session_state.comet_cache.copy()
         if not df_comets_show.empty:
             df_comets_show['_sort'] = pd.to_numeric(
                 df_comets_show.get('Vespera act.', pd.Series(dtype=float)), errors='coerce'
-            ).fillna(pd.to_numeric(
-                df_comets_show.get('Vespera@peri', pd.Series(dtype=float)), errors='coerce'
-            ).fillna(0))
+            ).fillna(pd.to_numeric(df_comets_show.get('Vespera@peri', pd.Series(dtype=float)), errors='coerce').fillna(0))
             df_comets_show = df_comets_show.sort_values('_sort', ascending=False).drop(columns=['_sort'])
-            cols_c = [c for c in [
-                "Nom",
-                "Dernier peri.", "Prochain peri.", "Période",
-                "Mag.actuelle", "Élong. (°)", "Observable ?", "Vespera act.", "Obs. actuelle",
-                "Mag.@peri", "Vespera@peri", "Obs.@peri",
-                "g", "k", "q (UA)", "e", "i (°)"
-            ] if c in df_comets_show.columns]
+            cols_c = [c for c in ["Nom","Dernier peri.","Prochain peri.","Période",
+                                   "Mag.actuelle","Élong. (°)","Observable ?","Vespera act.","Obs. actuelle",
+                                   "Mag.@peri","Vespera@peri","Obs.@peri","g","k","q (UA)","e","i (°)"] if c in df_comets_show.columns]
             st.dataframe(df_comets_show[cols_c], use_container_width=True, hide_index=True)
-            st.caption(
-                "Dernier peri. = dernier passage au périhélie · "
-                "Prochain peri. = prochain passage calculé (Kepler) · "
-                "Période = durée d'une révolution · "
-                "Mag.actuelle via Horizons (comètes g<18) · "
-                "Élong. >20° requis · g = mag absolue · k = pente · q = périhélie (UA)"
-            )
         else:
-            st.markdown('<div class="empty">// AUCUNE COMÈTE CHARGÉE //</div>', unsafe_allow_html=True)
+            st.markdown('<div class="empty">// AUCUNE COMÈTE //</div>', unsafe_allow_html=True)
 
-# ── TAB 5 : LEXIQUE ───────────────────────────────────────────────────────────
-with tab5:
+
+# ── TAB 6 : LEXIQUE ───────────────────────────────────────────────────────────
+with tab6:
     st.markdown('<div class="sec">Lexique & Ordres de Grandeur</div>', unsafe_allow_html=True)
-
     def lx(title, entries, color="#00d4ff"):
-        rows = "".join(
+        rows_html = "".join(
             f"<div style='display:flex;gap:10px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:.8em'>"
             f"<span style='color:var(--muted);min-width:115px;font-family:var(--mono)'>{k}</span>"
-            f"<span style='color:var(--text)'>{v}</span></div>"
-            for k, v in entries
-        )
+            f"<span style='color:var(--text)'>{v}</span></div>" for k, v in entries)
         st.markdown(
             f"<div style='border-left:4px solid {color};padding:13px 15px;background:var(--surface);"
             f"border-radius:10px;border:1px solid var(--border);margin-bottom:5px'>"
             f"<div style='font-family:var(--ui);font-weight:700;font-size:.87em;letter-spacing:2px;"
-            f"text-transform:uppercase;color:{color};margin-bottom:9px'>{title}</div>{rows}</div>",
+            f"text-transform:uppercase;color:{color};margin-bottom:9px'>{title}</div>{rows_html}</div>",
             unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
     with c1:
+        lx("🌟 Supernovæ · Types & Physique", [
+            ("Type Ia",   "Naine blanche thermonucléaire — chandelle standard cosmologique"),
+            ("Type II",   "Effondrement cœur d'étoile massive (≥8 M☉) — supergéante rouge"),
+            ("Type Ib/c", "Idem II mais étoile ayant perdu H (Ib) ou H+He (Ic) — Wolf-Rayet"),
+            ("SLSN",      "Super-lumineuse : 10-100× plus brillante qu'une SN normale"),
+            ("TDE",       "Disruption par marées : étoile déchiquetée par un trou noir"),
+            ("Galactique","Lat. gal. |b| < 15° — dans le plan de la Voie Lactée"),
+            ("SNEWS",     "Réseau détecteurs neutrinos — alerte AVANT la lumière visible"),
+            ("Kilonova",  "Fusion d'étoiles à neutrons — forge l'or, le platine, l'uranium"),
+        ], color="#b44eff")
         lx("🛰️ Source : NASA Scout API", [
-            ("URL",       "ssd-api.jpl.nasa.gov/scout.api (mode S = liste complète)"),
-            ("Avantage",  "Données riches : Vmag, MOID, CA dist, score NEO MPC, elong, rate"),
-            ("Transition","Quand un objet est désigné officiellement, il disparaît de Scout → signal propre"),
-            ("Rate limit","60s minimum entre requêtes (partagé avec CAD)"),
+            ("URL",       "ssd-api.jpl.nasa.gov/scout.api (mode S)"),
+            ("Avantage",  "Vmag, MOID, CA dist, score NEO, elong, rate"),
+            ("Transition","Objet désigné → disparaît de Scout = signal propre"),
+            ("Rate limit","60s minimum entre requêtes"),
         ])
         lx("📐 H · Magnitude Absolue", [
-            ("H < 18",  "Géant >1 km — extinction de masse si impact"),
+            ("H < 18",  "Géant >1 km — extinction de masse"),
             ("H 18–22", "Régional 100m–1km — destruction d'une ville"),
-            ("H 22–25", "Local 10–100m — cratère Barringer (1.2 km)"),
-            ("H > 25",  "Mineur <10m — désintégration atmosphérique"),
+            ("H 22–25", "Local 10–100m — cratère Barringer"),
+            ("H > 25",  "Mineur <10m — désintégration atm."),
         ])
-        lx("🚨 Score de Dangerosité", [
-            ("H×35",      "Taille (H<18 → max, H=25 → 0)"),
-            ("Arc×25",    "Incertitude orbitale (arc<0.5j → max)"),
-            ("NObs×20",   "Fraîcheur (<5 obs → max, découverte récente)"),
-            ("MOID×10",   "Proximité orbitale Terre (MOID<0.01 UA → max)"),
-            ("ScoreNEO×10","Probabilité d'être un NEO selon MPC"),
-            ("Reset",     "Alerte réinitialisée si score retombe sous 50"),
+        lx("🚨 Score Dangerosité", [
+            ("H×35",     "Taille (H<18→max)"), ("Arc×25", "Incertitude orbitale"),
+            ("NObs×20",  "Fraîcheur (<5 obs)"), ("MOID×10", "Proximité orbitale"),
+            ("NEO×10",   "Score MPC"),
         ], color="#ff4b4b")
-        lx("🎯 Algorithme Détection Transition", [
-            ("Méthode 1", "SBDB direct : query NASA par tdes → désignation officielle immédiate"),
-            ("Méthode 2", "Similarité H ±0.5 dans NASA CAD → correspondance probable"),
-            ("Méthode 3", "Disparu sans correspondance = non confirmé ou fausse détection"),
-            ("Limite",    "Le renommage change toujours le tdes → méthode 1 est la plus fiable"),
-            ("Confiance", "Méthode 1 = certaine · Méthode 2 = probable · Méthode 3 = inconnue"),
-        ], color="#f7b731")
-
     with c2:
         lx("🔭 Score Vespera II", [
-            ("Instrument",  "50mm f/5, Sony IMX585, stacking live"),
-            ("100 trivial",  "Mag ≤ 10 — visible à l'œil nu"),
-            ("90 excellent", "Mag ≤ 14.5 — session 10 min"),
-            ("70 bon",       "Mag ≤ 16.0 — 30 min stacking"),
-            ("45 limite",    "Mag ≤ 17.5 — nuit entière, ciel sombre"),
-            ("15 difficile", "Mag ≤ 19.0 — conditions optimales"),
-            ("0 impossible", "Mag > 19.0 — hors portée instrument"),
-            ("⚠️",          "Mag estimée ≠ mag réelle (position, activité, LP)"),
+            ("Instrument", "50mm f/5, Sony IMX585, stacking live"),
+            ("100 trivial", "Mag ≤ 10 — œil nu"), ("90 excellent", "Mag ≤ 14.5 — 10 min"),
+            ("70 bon",      "Mag ≤ 16.0 — 30 min"), ("45 limite", "Mag ≤ 17.5 — nuit entière"),
+            ("15 difficile","Mag ≤ 19.0"), ("0 impossible", "Mag > 19.0"),
         ], color="#f7b731")
         lx("📏 Distances & Vitesses", [
-            ("1 LD",     "384 400 km = distance Terre–Lune"),
-            ("MOID",     "Distance minimale orbitale Terre–objet (UA)"),
-            ("CA min",   "Distance minimale d'approche dans la fenêtre (LD)"),
-            ("v_inf",    "Vitesse à l'infini (km/s) — relative à la Terre"),
-            ("Rate",     "Vitesse angulaire au ciel (\"/min) — utile pour l'observation"),
-            ("Unc.",     "Incertitude de position (\" arc) — orbite mal contrainte si élevée"),
+            ("1 LD",   "384 400 km = Terre–Lune"), ("MOID", "Distance min orbitale (UA)"),
+            ("CA min", "Dist min approche (LD)"), ("v_inf", "Vitesse relative (km/s)"),
+            ("Rate",   "Vitesse angulaire (\"/min)"), ("Unc.", "Incertitude position (\" arc)"),
         ], color="#00ff88")
         lx("🌠 Paramètres Cométaires", [
-            ("g",       "Magnitude absolue cométaire (typiq. 4–12)"),
-            ("k",       "Pente d'évolution (standard ≈ 4, hyperactif > 10)"),
-            ("q (UA)",  "Périhélie — < 1 UA = géocroisante"),
-            ("e",       "Excentricité — ≥ 1 = orbite hyperbolique (comète interstellaire ?)"),
-            ("i (°)",   "> 90° = orbite rétrograde"),
+            ("g",      "Magnitude absolue (typiq. 4–12)"), ("k", "Pente (standard≈4, hyperactif>10)"),
+            ("q (UA)", "Périhélie — <1 UA = géocroisante"), ("e", "≥1 = orbite hyperbolique"),
+            ("i (°)",  ">90° = orbite rétrograde"),
         ], color="#00ff88")
         lx("🔔 Alertes Discord", [
-            ("🆕 Nouvel",  "Apparu dans Scout (une fois)"),
-            ("🎯 Désigné", "Transition NEOCP→NASA détectée (méthode 1/2/3)"),
-            ("👻 Disparu", "Retiré sans désignation (non confirmé)"),
-            ("🔥 ≥50",    "Score franchit 50 (reset si redescend)"),
-            ("🚨 ≥80",    "Score critique"),
-            ("📊 Top 5",  "Changement de classement"),
-            ("📊 Horaire","Bilan chaque heure"),
+            ("🚨 Galactique", "SN dans plan galactique — événement du siècle"),
+            ("🌟 Vespera SN", "SN observable avec Vespera II (score ≥45)"),
+            ("🔔 Nouvelle SN","SN < mag 19 détectée"),
+            ("🆕 Nouvel NEO", "Apparu dans Scout"),
+            ("🎯 Désigné",   "Transition NEOCP→NASA"), ("👻 Disparu", "Retiré sans désignation"),
+            ("🔥 ≥50",       "Score NEO franchit 50"), ("🚨 ≥80", "Score critique"),
+            ("📊 Horaire",   "Bilan toutes les heures"),
         ], color="#ff4b4b")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BAS DE PAGE : SISMOGRAPHE + STATUT
@@ -1417,23 +1632,34 @@ st.markdown("---")
 cs, ci2 = st.columns([1.3, 1])
 
 with cs:
-    st.markdown('<div class="sec">📈 Sismographe de Score</div>', unsafe_allow_html=True)
-    # Sismographe = UNIQUEMENT les objets encore dans obj_history (purgé automatiquement)
-    hist_keys = sorted(st.session_state.obj_history.keys())
-    if hist_keys:
-        # Si la sélection précédente n'existe plus → forcer le premier élément
-        prev_sismo = st.session_state.get("_sismo_prev", hist_keys[0])
-        default_idx = hist_keys.index(prev_sismo) if prev_sismo in hist_keys else 0
-        target = st.selectbox("Objet actif :", hist_keys, index=default_idx, key="sismo")
-        st.session_state["_sismo_prev"] = target
-        hdf = pd.DataFrame(st.session_state.obj_history[target]).set_index("T")
-        st.line_chart(hdf[["S"]], color="#00d4ff")
-        last = st.session_state.obj_history[target][-1]
-        st.caption(f"Score={last['S']} | H={last.get('H','?')} | Vmag={last.get('Vmag','?')} | "
-                   f"NObs={last.get('NObs','?')} | Arc={last.get('Arc','?')}j | MOID={last.get('moid','?')}")
-    else:
-        st.session_state["_sismo_prev"] = None
-        st.markdown('<div class="empty">// PAS D\'OBJETS ACTIFS DANS L\'HISTORIQUE //</div>', unsafe_allow_html=True)
+    tab_sismo_neo, tab_sismo_sn = st.tabs(["📈 Sismographe NEO", "🌟 Évolution SN"])
+    with tab_sismo_neo:
+        hist_keys = sorted(st.session_state.obj_history.keys())
+        if hist_keys:
+            prev_sismo = st.session_state.get("_sismo_prev", hist_keys[0])
+            default_idx = hist_keys.index(prev_sismo) if prev_sismo in hist_keys else 0
+            target = st.selectbox("Objet actif :", hist_keys, index=default_idx, key="sismo")
+            st.session_state["_sismo_prev"] = target
+            hdf = pd.DataFrame(st.session_state.obj_history[target]).set_index("T")
+            st.line_chart(hdf[["S"]], color="#00d4ff")
+            last = st.session_state.obj_history[target][-1]
+            st.caption(f"Score={last['S']} | H={last.get('H','?')} | Vmag={last.get('Vmag','?')} | "
+                       f"NObs={last.get('NObs','?')} | Arc={last.get('Arc','?')}j")
+        else:
+            st.markdown('<div class="empty">// PAS D\'OBJETS DANS L\'HISTORIQUE //</div>', unsafe_allow_html=True)
+
+    with tab_sismo_sn:
+        sn_hist_keys = [k for k, v in st.session_state.sn_history.items() if len(v) >= 2]
+        if sn_hist_keys:
+            target_sn = st.selectbox("Supernova :", sn_hist_keys, key="sismo_sn")
+            sn_hdf = pd.DataFrame(st.session_state.sn_history[target_sn]).set_index("T")
+            st.line_chart(sn_hdf[["Mag"]], color="#b44eff")
+            last_sn = st.session_state.sn_history[target_sn][-1]
+            first_sn = st.session_state.sn_history[target_sn][0]
+            delta_mag = last_sn["Mag"] - first_sn["Mag"]
+            st.caption(f"Mag actuelle : {last_sn['Mag']} | Évolution : {'📈 +' if delta_mag > 0 else '📉 '}{delta_mag:.2f} mag (fading↑ = normal)")
+        else:
+            st.markdown('<div class="empty">// PAS ASSEZ DE DONNÉES SN ENCORE //</div>', unsafe_allow_html=True)
 
 with ci2:
     st.markdown('<div class="sec">⏱ Statut Système</div>', unsafe_allow_html=True)
@@ -1444,27 +1670,28 @@ with ci2:
         f"<div style='font-family:var(--mono);font-size:.78em;color:var(--muted);margin-top:8px;line-height:2'>"
         f"🕐 {datetime.now().strftime('%H:%M:%S')} · 🔄 {refresh_rate}s<br>"
         f"🌍 {radius_ld} LD · 📅 {horizon_days}j<br>"
-        f"🔭 Vespera {'ON H≤'+str(mag_limit) if vespera_mode else 'OFF (Scout non filtré)'}</div>",
+        f"🌟 SN : {n_sn} ({n_sn_vesp} Vespera)<br>"
+        f"🔭 Vespera {'ON H≤'+str(mag_limit) if vespera_mode else 'OFF'}</div>",
         unsafe_allow_html=True)
 
     st.markdown('<div class="sec" style="margin-top:18px">🔔 Journal Discord</div>', unsafe_allow_html=True)
     if st.session_state.discord_log:
-        rows = ""
-        for ts, stat, prev in reversed(st.session_state.discord_log[-10:]):
+        rows_dc = ""
+        for ts, stat, prev in reversed(st.session_state.discord_log[-12:]):
             cls = "dc-ok" if "OK" in stat else ("dc-w" if "HTTP" in stat else "dc-err")
-            rows += (f"<div class='dc-row'><span class='dc-ts'>{ts}</span>"
-                     f"<span class='{cls}'>{stat}</span>"
-                     f"<span class='dc-msg'>{prev[:45]}</span></div>")
+            rows_dc += (f"<div class='dc-row'><span class='dc-ts'>{ts}</span>"
+                        f"<span class='{cls}'>{stat}</span>"
+                        f"<span class='dc-msg'>{prev[:45]}</span></div>")
         st.markdown(
             f"<div style='background:var(--surface);border:1px solid var(--border);"
-            f"border-radius:8px;padding:10px 12px;max-height:160px;overflow-y:auto'>{rows}</div>",
+            f"border-radius:8px;padding:10px 12px;max-height:180px;overflow-y:auto'>{rows_dc}</div>",
             unsafe_allow_html=True)
     else:
-        st.markdown("<div class='empty' style='font-size:.76em'>Aucune alerte cette session</div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='empty' style='font-size:.76em'>Aucune alerte cette session</div>", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTO-REFRESH
 # ═══════════════════════════════════════════════════════════════════════════════
+st.session_state.last_refresh = datetime.now()
 time.sleep(refresh_rate)
 st.rerun()
